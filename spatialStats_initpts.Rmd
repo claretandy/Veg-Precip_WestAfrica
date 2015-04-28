@@ -1,0 +1,440 @@
+---
+title: "Spatial Dependence of Initiation Points"
+author: "Andy Hartley"
+date: "25 September 2014"
+output: html_document
+---
+
+This document examines the spatial dependence of the initiation points. It tests for clustering, and looks for covariance between the locations of points and vegetation boundaries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+library(raster)
+library(rasterVis)
+library(rgdal)
+library(knitr)
+library(spatstat)
+library(geostatsp)
+library(ggplot2)
+
+source("functions/loadAllAncils.R")
+source("functions/loadVeg.R") # Returns myveg = fractional veg cover for each pft tile
+source("functions/loadOtherAncils.R")
+source("functions/makeBoxes.R") 
+source("functions/vegPrep.R") # Returns allveg = vegetation classess (1 to 6) AND veg classes intersected with zones (i.e. boxes)
+source("functions/patches.R")
+source("functions/mcsStats.R")
+source("functions/popStats.R")
+source("functions/initiations.R")
+source("functions/makeLines.R")
+source("getMyData.R")
+source("trackCheck.R")
+source("functions/saveSpatial.R")
+
+if (Sys.info()[["sysname"]] == "Darwin"){
+    indatadir <- "/Users/ajh235/Work/DataLocal/ModelData/WAFR/"
+    dlresultsdir <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/Users/ajh235/Work/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/Users/ajh235/Work/Scratch/"
+} else {
+    indatadir <- "/data/local/hadhy/ModelData/WAFR/"
+    dlresultsdir <- "/data/local/hadhy/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/home/h02/hadhy/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/data/local/hadhy/Scratch/"
+    require(PP,lib.loc="/project/ukmo/rhel6/R")
+}
+
+rasterOptions(tmpdir=scratchdir, todisk=F)
+
+timestep <- "5min" # "10min" # "avg"
+threshold <- 1000
+myproj <- "ll" # Should be "ll" for paper
+models <- c("rb5216.4km.std", "rb5216.4km.50k", "rb5216.4km.300k")[1] # [2:3]
+id <- "s" # c("s","w","y")#[2:3]
+
+# Get precip data
+mydata <- getMyData(timestep=timestep, var="lsrain", overwrite=F)
+rb5216.4km.std <- mydata
+
+# land_simple <- readOGR(dsn=paste(indatadir,"ancils",sep=""), layer="land_ll") # Lat Long
+
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=0.3, bndDef=2, nBuf=3, overwrite=F)
+spp        <- ancils$spp
+spp.r      <- ancils$spp.r
+myveg      <- ancils$myveg
+mylandfrac <- ancils$mylandfrac
+myorog     <- ancils$myorog
+mycl       <- ancils$mycl
+mycl.f     <- ancils$mycl.f
+mycl.z     <- ancils$mycl.z
+land_simple<- ancils$land_simple
+
+myLUT <- data.frame(ID=c(1,2,3,4,7), Landcover=factor(c("tree", "grass", "sparse", "boundary", "orography"), levels=c("tree", "grass", "sparse", "boundary", "orography")[c(3,2,4,1,5)]), Colours=c("dark green", "yellow", "orange", "sienna", "dark grey"), plotOrder=c(4,2,1,3,5))
+
+mycl.1b <- mycl
+mycl.1b[mycl.1b == 5] <- 4
+mycl.1b[mycl.1b == 6] <- 4
+mycl.1bf <- as.factor(mycl.1b)
+ftab <- myLUT[myLUT$ID %in% levels(mycl.f)[[1]]$ID, ]
+levels(mycl.1bf) <- ftab
+
+# Load bt_results_new - see check_backtracked2.Rmd
+outresults_file <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/backtracked_results_1000km_5min_POP1t_removed.Rdata"
+load(outresults_file)
+
+results_ll <- readOGR(dsn='/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/LatLongMapData/', layer="bt_results_POP1t_removed_ll")
+
+```
+
+```{r functions, include=FALSE, cache=TRUE}
+
+bootStrap <- function(indata, size, reps){
+    # indata = all raster values
+    # size   = 
+    indata <- indata[!is.na(indata)]
+    size <- length(indata)
+    bootresults <- vector("list")
+    for (r in 1:reps){
+        bootresults[[r]] <- table(sample(indata, size, replace=TRUE))
+    }
+    return(bootresults)
+}
+
+
+testSig <- function(intable, inarea, testtype="poisson"){
+    pvals <- vector("numeric")
+    for (x in 1:length(intable)){
+        if (testtype == "poisson"){
+            xpval <- poisson.test(x=c(intable[x],sum(intable[-x], na.rm=T)), T=c(inarea[x], sum(inarea[-x], na.rm=T)), alternative="greater", conf.level=0.95)$p.value            
+        } 
+        if (testtype == 'binom'){
+            xpval <- binom.test(x=intable[x], n=sum(intable, na.rm=T), p=inarea[x]/sum(inarea, na.rm=T), alternative="greater")$p.value
+        }
+        pvals <- c(pvals, xpval)
+    }
+    return(round(pvals, 5))
+}
+
+getInitTable <- function(mycl.f, mycl.z, results_ll, tstart, tend, maxID, selclass, masked=TRUE){
+    # Total Land Area per veg class
+    if (masked){
+        mycl.f <- mask(mycl.f, mycl.z)        
+    } 
+    areasqkm <- raster::area(mycl.f)
+
+    mycl.f.area <- round(zonal(areasqkm, mycl.f, fun='sum'))
+    nicetable <- data.frame("ID"=mycl.f.area[,"zone"], "class"=as.character(myLUT[match(mycl.f.area[,"zone"], myLUT$ID), "Landcover"]), "AreaSQKM"=mycl.f.area[,"sum"], "Percent"=round(100*mycl.f.area[,"sum"] / sum(mycl.f.area), 1))
+    
+    ## Next, get the initiations within the study zone
+    # All initiations
+    allinit <- results_ll[results_ll$ID <= maxID & results_ll$class == selclass, ]
+    # MCS Initiations in the afternoon / evening 
+    aftinit <- results_ll[results_ll$ID <= maxID & results_ll$class == selclass & results_ll$Hour >= tstart & results_ll$Hour <= tend,]
+    
+    # Extract classes for init points
+    allinit$Landcover <- extract(mycl.f, allinit)
+    aftinit$Landcover <- extract(mycl.f, aftinit)
+    
+    # How many initiations over boundaries at all times of day?
+    allinit.count <- table(allinit$Landcover) # Count per class
+    allinit.perc  <- round(100 * allinit.count / sum(allinit.count) , 1) # %
+    #allinit.bndsize <- as.numeric(allinit.count[which(as.numeric(names(allinit.count)) == 4)])
+    #allinit.uncert<- bootStrap(indata=allinit$class, size=allinit.bndsize, reps=1000)
+    allinit.pvals <- testSig(allinit.count, mycl.f.area[,"sum"], testtype="binom")
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(allinit.count)))
+    
+    nicetable_all <- data.frame(class=myLUT[myi,"Landcover"], AllInitCount=as.vector(allinit.count), AllInitPercent=as.vector(allinit.perc), AllPvalues=allinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_all, by="class", all.x=T)
+    
+    # Setup dataset for ggplot
+    freqdata <- data.frame(table(allinit@data[!is.na(allinit$Landcover),"Hour"]))
+    
+    # How many initiations over boundaries between tstart and tend? 
+    aftinit.count <- table(aftinit$Landcover) # Count per class
+    aftinit.perc  <- round(100 * aftinit.count / sum(aftinit.count) , 1) # %
+    aftinit.pvals <- testSig(aftinit.count, mycl.f.area[,"sum"], testtype="binom")
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(aftinit.count)))
+    nicetable_aft <- data.frame(class=myLUT[myi,"Landcover"], AftInitCount=as.vector(aftinit.count), AftInitPercent=as.vector(aftinit.perc), AftPvalues=aftinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_aft, by="class", all.x=T)
+
+    return(list(nicetable=nicetable, mycl.f.area=mycl.f.area, freqdata=freqdata, allinit=allinit[!is.na(allinit$Landcover),], aftinit=aftinit[!is.na(aftinit$Landcover),]))
+}
+
+## Summarizes data.
+## Gives count, mean, standard deviation, standard error of the mean, and confidence interval (default 95%).
+##   data: a data frame.
+##   measurevar: the name of a column that contains the variable to be summariezed
+##   groupvars: a vector containing names of columns that contain grouping variables
+##   na.rm: a boolean that indicates whether to ignore NA's
+##   conf.interval: the percent range of the confidence interval (default is 95%)
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+                      conf.interval=.95, .drop=TRUE) {
+    require(plyr)
+
+    # New version of length which can handle NA's: if na.rm==T, don't count them
+    length2 <- function (x, na.rm=FALSE) {
+        if (na.rm) sum(!is.na(x))
+        else       length(x)
+    }
+
+    # This does the summary. For each group's data frame, return a vector with
+    # N, mean, and sd
+    datac <- ddply(data, groupvars, .drop=.drop,
+      .fun = function(xx, col) {
+        c(N    = length2(xx[[col]], na.rm=na.rm),
+          mean = mean   (xx[[col]], na.rm=na.rm),
+          sd   = sd     (xx[[col]], na.rm=na.rm)
+        )
+      },
+      measurevar
+    )
+
+    # Rename the "mean" column    
+    datac <- rename(datac, c("mean" = measurevar))
+
+    datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+
+    # Confidence interval multiplier for standard error
+    # Calculate t-statistic for confidence interval: 
+    # e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+    ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+    datac$ci <- datac$se * ciMult
+
+    return(datac)
+}
+```
+
+```{r defaultBnd_setup, cache=TRUE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 0
+tend         <- 23
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultBoundary_loadData, include=FALSE, cache=TRUE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+```
+
+## Simple plots of the data
+
+```{r results='asis', fig.height=6, fig.width=9, fig.align='center', cache=TRUE}
+X <- as.ppp(allinit[,"Hour"])
+Q <- quadratcount(X, nx=5,ny=3)
+plot(X, main="Location of points at different times of day")
+plot(Q, add=T)
+den <- density(X, sigma=1)
+plot(den, main="Density of points at all times of the day")
+plot(X, add=T)
+contour(den, main = "Contour plot of density of points for all hours of the day")
+marks(X) <- factor(marks(X), levels=0:23)
+#plot(density(split(X)), ribbon=FALSE, zlim=c(0,1), main="Density of points for each time slice")
+rbl <- vector("list")
+den <- density(split(X), sigma=0.4)
+for (x in 1:length(den)){
+    rbl[[x]] <- raster(den[[x]])
+}
+rb <- brick(rbl)
+levelplot(rb, names.attr=1:24, col.regions=topo.colors(100), main="Density of points by hour") + latticeExtra::layer(sp.polygons(ancils$land_simple))
+
+```
+
+## Are the points clustered?
+```{r fig.height=6, fig.width=9, fig.align='center', cache=TRUE}
+miplot(X)
+```
+The above shows the chi-square statistic (based on quadrat counts) against a linearly changing diameter of quadrat (in degrees)
+
+
+```{r fig.height=6, fig.width=9, fig.align='center', cache=TRUE}
+XK <- Kest(X)
+plot(XK)
+E <- envelope(X, Kest, nsim=39)
+plot(E)
+
+# Is there Complete Spatial Randomness?
+M <- quadrat.test(X, nx=5, ny=3)
+M
+plot(M)
+```
+Null hypothesis: There is complete spatial randomness (CSR).
+The p-value is < 0.001, so we reject the null hypothesis.
+
+The above plot shows the following per quadrant:
+
+* Top left corner: observed counts 
+* Top right corner: expected counts
+* Bottom: Pearson residuals (obs - exp) / sqrt(exp)
+
+A more robust measure, however is the kstest
+
+### Null hypothesis: There is complete spatial randomness in the x dimension.
+```{r fig.height=6, fig.width=9, fig.align='center', cache=TRUE}
+Xxks <- cdf.test(X, "x", test="ks")
+plot(Xxks)
+Xxks
+```
+p-value > 0.001 so we do not reject the null hypothesis that there is CSR in the x dimension
+
+### Null hypothesis: There is complete spatial randomness in the y dimension.
+```{r fig.height=6, fig.width=9, fig.align='center', cache=TRUE}
+Xyks <- cdf.test(X, "y", test="ks")
+plot(Xyks)
+Xyks
+```
+p-value < 0.001 so we reject the null hypothesis that there is CSR in the y dimension
+
+### Is there complete spatial randomness in the distance to a boundary?
+```{r fig.height=6, fig.width=9, fig.align='center', results='asis', cache=TRUE}
+r <- gridDistance(ancils$mycl.f, origin=4)/1000
+rim <- asImRaster(r)
+Xks <- cdf.test(X, rim, test="ks")
+plot(Xks)
+Xks
+```
+p-value < 0.001 so we reject the null hypothesis that there is Complete Spatial Randomness in the distance to a boundary
+
+NB: This is perhaps what we would expect given that boundaries are found in fixed locations.
+
+## Is the intensity of the points a function of the distance to a tree-grass boundary?
+
+For all times of day ...
+```{r cache=TRUE}
+plot(rhohat(X, rim))
+```
+
+For 13 to 15 ...
+```{r cache=TRUE}
+tstart <- 13
+tend   <- 15
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+
+aftinit <- inittable$aftinit[,"Hour"]
+Xhr <- as.ppp(aftinit)
+marks(Xhr) <- factor(marks(Xhr), levels=tstart:tend)
+plot(rhohat(Xhr, rim))
+
+```
+
+The above looks nice, but it is not 100% clear what it means. I think it means that we are more likely to find a greater intensity of points near to boundaries than far away from boundaries.
+
+## Can we plot this instead as a simple histogram instead with expected (+uncertainty) overlaid?
+```{r smallBnd_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+nclasses     <- 4
+```
+
+```{r smallBoundary_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+r <- gridDistance(ancils$mycl.f, origin=4)/1000
+rz <- trim(raster::mask(r, ancils$mycl.z))
+allinit$dist2bnd <- extract(x = r, y = allinit)
+aftinit$dist2bnd <- extract(x = r, y = aftinit)
+
+# This gets the break points for equal class sizes. 
+alldist <- getValues(mask(r,ancils$mycl.z))
+ci <- classIntervals(alldist, n=nclasses, style="quantile")
+
+```
+
+```{r smallBoundary_plots, fig.height=6, fig.width=9, fig.align='center', results='asis', cache=FALSE}
+plot(ci, pal=c("wheat1","red3"), main="Distance from points to boundary pixels")
+# Plots the histogram in the zone for each class
+hist(alldist, breaks=ci$brks, freq=T, main="Frequency of each class in the study area")
+# Plots the histogram in the zone for each class
+hist(allinit$dist2bnd, breaks=ci$brks, freq=T, main="Frequency of all initiations in each proximity to boundary class")
+len <- length(allinit$dist2bnd)
+bt <- binom.test(round(len/nclasses, 0), len, p=1/nclasses, alternative="two.sided")
+lines(x=c(0,signif(max(allinit$dist2bnd)+10, 2)), y=c(round(len/nclasses, 0),round(len/nclasses, 0)), lty=1, col="red")
+lines(x=c(0,signif(max(allinit$dist2bnd)+10, 2)), y=c(len*bt$conf.int[1],len*bt$conf.int[1]), lty=2, col="red")
+lines(x=c(0,signif(max(allinit$dist2bnd)+10, 2)), y=c(len*bt$conf.int[2],len*bt$conf.int[2]), lty=2, col="red")
+
+# Plots the histogram for afternoon initiations
+hist(aftinit$dist2bnd, breaks=ci$brks, freq=T, main="Frequency of afternoon initiations in each \"proximity to boundary\" class", xlab="Distance to boundary")
+len <- length(aftinit$dist2bnd)
+bt <- binom.test(round(len/nclasses, 0), len, p=1/nclasses, alternative="two.sided")
+lines(x=c(0,signif(max(aftinit$dist2bnd)+10, 2)), y=c(round(len/nclasses, 0),round(len/nclasses, 0)), lty=1, col="red")
+lines(x=c(0,signif(max(aftinit$dist2bnd)+10, 2)), y=c(len*bt$conf.int[1],len*bt$conf.int[1]), lty=2, col="red")
+lines(x=c(0,signif(max(aftinit$dist2bnd)+10, 2)), y=c(len*bt$conf.int[2],len*bt$conf.int[2]), lty=2, col="red")
+
+```
+
+Unfortunately the 'expected' line with uncertainty bounds doesn't quite work here because there are a different number of grid cells in each "proximity to boundary" class. This is due to the fact that we have `r length(which(aftinit$dist2bnd == 0.0))` (afternoon) and `r length(which(allinit$dist2bnd == 0.0))` (all day) initiations on boundaries, where the distance is 0 of course.
+
+```{r smallBoundary_plots2, fig.height=6, fig.width=9, fig.align='center', results='asis', cache=FALSE}
+# allinit$Hour <- factor(allinit$Hour, levels = 0:23, labels=0:23)
+
+ggplot(data=allinit@data, aes(x=as.factor(Hour), y=dist2bnd)) + stat_summary(fun.y=mean, geom="bar") + stat_summary(fun.data="mean_cl_boot", geom = "errorbar", col="red")
+```
+
+```{r smallBoundary_plots3, fig.height=6, fig.width=9, fig.align='center', results='asis', cache=FALSE}
+ggplot(data=allinit@data, aes(x=as.factor(Hour), y=dist2bnd)) + geom_boxplot() + geom_jitter()
+```
+
+```{r smallBoundary_plots4, fig.height=6, fig.width=9, fig.align='center', results='asis', cache=FALSE}
+ggplot(data=allinit@data[which(allinit$Hour!=8),], aes(x=dist2bnd, colour=as.factor(Hour))) + geom_density()
+```
+
+```{r smallBoundary_plots5, fig.height=6, fig.width=9, fig.align='center', results='asis', cache=FALSE}
+# Split the hours into groups ...
+allinit$HourGroup <- NA
+allinit$HourGroup[allinit$Hour >= 1 & allinit$Hour <= 3] <- "Night"
+allinit$HourGroup[allinit$Hour >= 7 & allinit$Hour <= 9] <- "Morning"
+allinit$HourGroup[allinit$Hour >= 15 & allinit$Hour <= 17] <- "Afternoon"
+allinit$HourGroup[allinit$Hour >= 18 & allinit$Hour <= 20] <- "Evening"
+allinit$HourGroup <- factor(allinit$HourGroup, levels=c("Morning", "Afternoon", "Evening","Night"))
+
+ggplot(data=allinit@data[which(!is.na(allinit@data$HourGroup)),], aes(x=dist2bnd, colour=HourGroup)) + geom_density()
+
+ggplot(data=allinit@data[which(!is.na(allinit@data$HourGroup)),], aes(x=dist2bnd, colour=HourGroup)) + geom_density() + scale_x_log10()
+
+ggplot(data=allinit@data[which(!is.na(allinit@data$HourGroup)),], aes(x=dist2bnd, fill=HourGroup)) + geom_bar(position="dodge", binwidth=5)
+
+# Bootstrap samples to give expected + error bars
+bs_dist <- data.frame(Rep=integer(), nSample=integer(), Dist=numeric())
+for (n in c(20, 70,144, 353)){
+    for (x in 1:100){
+        bs_dist <- rbind(bs_dist, data.frame(Rep=x, nSample=n, Dist=sampleRandom(rz, size = n)))
+    }    
+}
+
+bs_dist$nSamplef <- factor(bs_dist$nSample)
+ggplot(data=bs_dist, aes(x=Dist, group=nSamplef)) + geom_density(aes(colour=nSamplef))
+
+
+```
+
+
+

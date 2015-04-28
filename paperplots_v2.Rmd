@@ -1,0 +1,525 @@
+---
+title: "Paper Plots v2"
+author: "Andy Hartley"
+date: "29 August 2014"
+output:
+  html_document:
+    theme: journal
+    toc: yes
+---
+
+This document has all the plots that go into the paper.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=FALSE)
+library(raster)
+library(rasterVis)
+library(latticeExtra)
+library(rgdal)
+library(knitr)
+library(spatstat)
+source("functions/loadAllAncils.R")
+source("functions/loadVeg.R") # Returns myveg = fractional veg cover for each pft tile
+source("functions/loadOtherAncils.R")
+source("functions/makeBoxes.R") 
+source("functions/vegPrep.R") # Returns allveg = vegetation classess (1 to 6) AND veg classes intersected with zones (i.e. boxes)
+source("functions/patches.R")
+source("functions/mcsStats.R")
+source("functions/popStats.R")
+source("functions/initiations.R")
+source("functions/makeLines.R")
+source("getMyData.R")
+source("trackCheck.R")
+source("functions/saveSpatial.R")
+source('~/Scripts/R/scale_fill_contbrewerpb.R')
+
+if (Sys.info()[["sysname"]] == "Darwin"){
+    indatadir <- "/Users/ajh235/Work/DataLocal/ModelData/WAFR/"
+    dlresultsdir <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/Users/ajh235/Work/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/Users/ajh235/Work/Scratch/"
+} else {
+    indatadir <- "/data/local/hadhy/ModelData/WAFR/"
+    dlresultsdir <- "/data/local/hadhy/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/home/h02/hadhy/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/data/local/hadhy/Scratch/"
+    require(PP,lib.loc="/project/ukmo/rhel6/R")
+}
+
+rasterOptions(tmpdir=scratchdir, todisk=F)
+
+timestep <- "5min" # "10min" # "avg"
+threshold <- 1000
+myproj <- "ll" # Should be "ll" for paper
+models <- c("rb5216.4km.std", "rb5216.4km.50k", "rb5216.4km.300k")[1] # [2:3]
+id <- "s" # c("s","w","y")#[2:3]
+
+# Get precip data
+mydata <- getMyData(timestep=timestep, var="lsrain", overwrite=F)
+rb5216.4km.std <- mydata
+
+# land_simple <- readOGR(dsn=paste(indatadir,"ancils",sep=""), layer="land_ll") # Lat Long
+
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=0.3, bndDef=2, nBuf=3, overwrite=F)
+spp        <- ancils$spp
+spp.r      <- ancils$spp.r
+myveg      <- ancils$myveg
+mylandfrac <- ancils$mylandfrac
+myorog     <- ancils$myorog
+mycl       <- ancils$mycl
+mycl.f     <- ancils$mycl.f
+mycl.z     <- ancils$mycl.z
+land_simple<- ancils$land_simple
+
+myLUT <- data.frame(ID=c(1,2,3,4,7), Landcover=factor(c("tree", "grass", "sparse", "boundary", "orography"), levels=c("tree", "grass", "sparse", "boundary", "orography")[c(3,2,4,1,5)]), Colours=c("dark green", "yellow", "orange", "sienna", "dark grey"), plotOrder=c(4,2,1,3,5))
+
+mycl.1b <- mycl
+mycl.1b[mycl.1b == 5] <- 4
+mycl.1b[mycl.1b == 6] <- 4
+mycl.1bf <- as.factor(mycl.1b)
+ftab <- myLUT[myLUT$ID %in% levels(mycl.f)[[1]]$ID, ]
+levels(mycl.1bf) <- ftab
+
+# Load bt_results_new - see check_backtracked2.Rmd
+outresults_file <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/backtracked_results_1000km_5min_POP1t_removed.Rdata"
+load(outresults_file)
+idfreq <- table(bt_results_new[,"ID"])
+idgt1 <- as.numeric(attributes(idfreq[!(idfreq == 1)])$dimnames[[1]])
+bt_results <- bt_results_new[bt_results_new$ID %in% idgt1,]
+coordinates(bt_results) <- ~x+y
+
+results_ll <- readOGR(dsn='/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/LatLongMapData/', layer="bt_results_POP1t_removed_ll")
+
+```
+
+```{r functions, include=FALSE, cache=FALSE}
+
+bootStrap <- function(indata, size, reps){
+    # indata = all raster values
+    # size   = 
+    indata <- indata[!is.na(indata)]
+    size <- length(indata)
+    bootresults <- vector("list")
+    for (r in 1:reps){
+        bootresults[[r]] <- table(sample(indata, size, replace=TRUE))
+    }
+    return(bootresults)
+}
+
+
+testSig <- function(intable, inarea, testtype="poisson"){
+    pvals <- vector("numeric")
+    for (x in 1:length(intable)){
+        if (testtype == "poisson"){
+            xpval <- poisson.test(x=c(intable[x],sum(intable[-x], na.rm=T)), T=c(inarea[x], sum(inarea[-x], na.rm=T)), alternative="greater", conf.level=0.95)$p.value            
+        } 
+        if (testtype == 'binom'){
+            xpval <- binom.test(x=intable[x], n=sum(intable, na.rm=T), p=inarea[x]/sum(inarea, na.rm=T), alternative="two.sided", conf.level=0.95)$p.value
+        }
+        pvals <- c(pvals, xpval)
+    }
+    return(round(pvals, 5))
+}
+
+getInitTable <- function(mycl.f, mycl.z, results_ll, tstart, tend, maxID, selclass, masked=TRUE){
+    # Total Land Area per veg class
+    if (masked){
+        mycl.f <- raster::mask(mycl.f, mycl.z)        
+    } 
+    areasqkm <- raster::area(mycl.f)
+    
+    mycl.f.area <- round(zonal(areasqkm, mycl.f, fun='sum'))
+    nicetable <- data.frame("ID"=mycl.f.area[,"zone"], "class"=as.character(myLUT[match(mycl.f.area[,"zone"], myLUT$ID), "Landcover"]), "AreaSQKM"=mycl.f.area[,"sum"], "Percent"=round(100*mycl.f.area[,"sum"] / sum(mycl.f.area), 1))
+    
+    ## Next, get the initiations within the study zone
+    # All initiations
+    allinit <- results_ll[results_ll$ID <= maxID & results_ll$class == selclass, ]
+    # MCS Initiations in the afternoon / evening 
+    aftinit <- results_ll[results_ll$ID <= maxID & results_ll$class == selclass & results_ll$Hour >= tstart & results_ll$Hour <= tend,]
+    
+    # Extract classes for init points
+    allinit$Landcover <- extract(mycl.f, allinit)
+    aftinit$Landcover <- extract(mycl.f, aftinit)
+    
+    
+    # How many initiations over boundaries at all times of day?
+    allinit.count <- table(allinit$Landcover) # Count per class
+    allinit.perc  <- round(100 * allinit.count / sum(allinit.count) , 1) # %
+    #allinit.bndsize <- as.numeric(allinit.count[which(as.numeric(names(allinit.count)) == 4)])
+    #allinit.uncert<- bootStrap(indata=allinit$class, size=allinit.bndsize, reps=1000)
+    allinit.pvals <- testSig(allinit.count, mycl.f.area[,"sum"], testtype="binom")
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(allinit.count)))
+    
+    nicetable_all <- data.frame(class=myLUT[myi,"Landcover"], AllInitCount=as.vector(allinit.count), AllInitPercent=as.vector(allinit.perc), AllPvalues=allinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_all, by="class", all.x=T)
+    
+    # Setup dataset for ggplot
+    freqdata <- data.frame(table(allinit@data[!is.na(allinit$Landcover),"Hour"]))
+    
+    # How many initiations over boundaries between tstart and tend? 
+    aftinit.count <- table(aftinit$Landcover) # Count per class
+    aftinit.perc  <- round(100 * aftinit.count / sum(aftinit.count) , 1) # %
+    aftinit.pvals <- testSig(aftinit.count, mycl.f.area[,"sum"], testtype="binom")
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(aftinit.count)))
+    nicetable_aft <- data.frame(class=myLUT[myi,"Landcover"], AftInitCount=as.vector(aftinit.count), AftInitPercent=as.vector(aftinit.perc), AftPvalues=aftinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_aft, by="class", all.x=T)
+
+    return(list(nicetable=nicetable, mycl.f.area=mycl.f.area, freqdata=freqdata, allinit=allinit[!is.na(allinit$Landcover),], aftinit=aftinit[!is.na(aftinit$Landcover),]))
+}
+```
+
+
+## Figure 1. Vegetation classes and numbered zones
+
+```{r figure_1, fig.height=6, fig.width=9}
+require(rasterVis)
+levelplot(mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.polygons(spp)) +
+    latticeExtra::layer(sp.text(loc=coordinates(spp), txt=1:nrow(spp@data), cex=3))
+```
+
+## Table 1. Initiations by Vegetation Type
+
+Test different boundary setups ...
+
+**bndDef** = Threshold pixels above which a boundary is defined. If a 3x3 window contains > bndDef pixels of tree and > bndDef pixels of grass, then the centre of the matrix is defined as a boundary pixel. This is then used in the buffering of boundaries (see nBuf). Values: 1, or 2 (results in >1 or >2). Default=2
+
+**nBuf** = Dimensions of the shifting window for identifying buffers. E.g. nBuf=3 means a 3x3 shifting window. If 1 boundary pixel is within a 3x3 window, the centre of that matrix is classified as boundary. In a 4km dataset, nBuf=3 means that Values: either 3, 5, or 7. Default=3
+
+**nBndClass** = Number of boundary classes. Values: either 1 or 3. Default=1
+
+**p-values** = Probability that a value chosen at random will fall within the 95% confidence interval of the expected distribution. Confidence intervals are calculated using a one-talied poisson test, by comparing the rate (initiations per km2 of a vegeation class) to the rate of all the other vegetation classes. If p-values are <0.05  
+
+
+```{r defaultBoundarySettings_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultBoundarySettings_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+
+results_ll$Landcover <- extract(ancils$mycl.f, results_ll)
+results_ll$Zone      <- extract(ancils$spp.r, results_ll)
+
+```
+
+
+```{r defaultBoundarySettings_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+
+### Area stats
+
+There are `r format(sum(mycl.f.area), big.mark = ",", scientific=F)` km2 in the study area (i.e. zones 1 to 15)
+
+There are `r sum(table(extract(mycl.z, allinit)))` initiations altogether, and `r sum(table(extract(mycl.z, aftinit)))` initiations in the afternoon period (`r tstart` to `r tend`).
+
+Total number of MCS recorded : `r nrow(subset(results_ll, Zone > 0 & class == "MCS Generation")@data)`
+
+
+## Figure 2.a Frequency of initiations at all times of day
+```{r Figure2a, fig.height=6, fig.width=9}
+require(ggplot2)
+# # How many initiations at different times of day?
+ggplot(data=freqdata, stat="identity", aes(x=Var1, y=Freq)) + geom_bar(fill="white", colour="black") + labs(title="Frequency of MCS initiations by time of day", x="Time of day", y="Frequency")
+```
+
+## Figure 2.b Frequency of initiations at all times of day for each veg class
+```{r Figure2b, fig.height=6, fig.width=9}
+require(ggplot2)
+
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=factor(Hour))) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+
+## Figure 3. MCS Afternoon initiations overlaid onto vegetation classes
+```{r Figure3, fig.height=6, fig.width=9}
+require(rasterVis)
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+
+levelplot(mycl.1bf, att="Landcover", maxpixels=600000, main=paste("Afternoon (",tstart,"-",tend+1,"Z) MCS Initiations Over Vegetation Classes", sep=""), xlim=c(-12,10), ylim=c(4,18), xlab=NULL, ylab=NULL, col.regions=as.character(ftab$Colours)) + # scales=list(draw=FALSE), xlim=c(-3,10), ylim=c(12,20)
+    latticeExtra::layer(sp.polygons(land_simple, lty=2)) +
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp))
+```
+
+## Figure 4. Spatially varying p-values 
+```{r Figure4_prep, cache=TRUE}
+
+shiftwin_size <- 100 #km
+rad <- function(km){0.036 * ceiling((km/(112*0.036))/2)}
+fwm <- focalWeight(mycl.f, d=rad(shiftwin_size), type="circle")
+fwm[fwm>0] <- 1
+
+# Number of boundary grid cells within a 100km shifting circle around the centre of each grid cell
+bndcnt.100km <- focal(mycl.f, w=fwm, fun=function(x, ...){na.omit(length(which(x==4)))}, na.rm=T, pad=T)
+# Number of land grid cells in the shifting window
+landcnt.100km <- focal(mycl.f, w=fwm, fun=function(x, ...){na.omit(length(which(x>0)))}, na.rm=T, pad=T)
+
+# Classify all points
+initpts_ll$Landcover <- extract(mycl.f, initpts_ll)
+# Remove non-land initiation points
+initpts_land <- initpts_ll[!is.na(initpts_ll$Landcover),]
+# Number of initiation points per grid cell
+initpts_landcount <- rasterize(as(initpts_land, "SpatialPoints"), bndcnt.100km, fun='count')
+# Take only boundary points
+initpts_bnd <- initpts_ll[initpts_ll$Landcover == 4 & !is.na(initpts_ll$Landcover),]
+# Count number of boundary points per grid cell
+initpts_bndcount <- rasterize(as(initpts_bnd, "SpatialPoints"), bndcnt.100km, fun='count')
+
+# Sum the number of land points per shifting window
+ipts.landcnt.100km <- focal(raster::mask(initpts_landcount, mycl.f), w=fwm, fun=function(x, ...){sum(na.omit(x))})
+# Sum the number of boundary points per shifting window
+ipts.bndcnt.100km <- focal(raster::mask(initpts_bndcount, mycl.f), w=fwm, fun=function(x, ...){sum(na.omit(x))})
+
+
+x <- ipts.bndcnt.100km
+n <- ipts.landcnt.100km
+p <- bndcnt.100km / landcnt.100km
+
+out <- raster(x)
+out <- setValues(out, NA)
+
+xi <- which(getValues(x)>0)
+vbinom <- Vectorize(binom.test, SIMPLIFY=TRUE, USE.NAMES=TRUE)
+out[xi] <- unlist(vbinom(x=x[xi], n=n[xi], p=p[xi], alternative="greater")["p.value",])
+```
+
+```{r Figure4_plots, fig.height=6, fig.width=9, cache=FALSE}
+require(rasterVis)
+levelplot(raster::mask(x/n, mycl.1bf), col.regions=rev(terrain.colors(100)), margin=F, zscaleLog=F, xlim=c(-12,10), ylim=c(4,18), xlab=NULL, ylab=NULL, colorkey=list(space="bottom"), at=seq(0,1,0.1), main=paste("Probability that an initiation point occurs over a boundary\nwithin a shifting window of radius ",shiftwin_size,"km", sep="")) + 
+    latticeExtra::layer(sp.points(initpts_bnd, cex=0.5, col='black')) + 
+    latticeExtra::layer(sp.polygons(land_simple, lty=2)) +
+    latticeExtra::layer(sp.polygons(spp))
+
+levelplot(raster::mask(p, mycl.1bf), col.regions=rev(terrain.colors(100)), margin=F, zscaleLog=F, xlim=c(-12,10), ylim=c(4,18), xlab=NULL, ylab=NULL, colorkey=list(space="bottom"), at=seq(0,1,0.1), main=paste("Probability of a boundary grid cell\nwithin a shifting window of radius ",shiftwin_size,"km", sep="")) + 
+    latticeExtra::layer(sp.points(initpts_bnd, cex=0.5, col='black')) + 
+    latticeExtra::layer(sp.polygons(land_simple, lty=2)) +
+    latticeExtra::layer(sp.polygons(spp))
+
+levelplot(raster::mask(out, mycl.1bf), col.regions=terrain.colors(100), margin=F, zscaleLog=F, at=c(0,0.01,0.1,0.2,0.5,1.0), xlim=c(-12,10), ylim=c(4,18), xlab=NULL, ylab=NULL, colorkey=list(space="bottom"), main=paste("Statistical significance of the difference between the observed proportion of\ninitiations over boundary and the expected number within a shifting window of radius ",shiftwin_size,"km", sep="")) + 
+    latticeExtra::layer(sp.points(initpts_bnd, cex=0.5, col='black')) + 
+    latticeExtra::layer(sp.polygons(land_simple, lty=2)) +
+    latticeExtra::layer(sp.polygons(spp))
+
+lp <- levelplot(mycl.1bf, att="Landcover", maxpixels=600000, main=paste("Convective Initiations Over Vegetation Classes", sep=""), xlim=c(-12,10), ylim=c(4,18), xlab=NULL, ylab=NULL, col.regions=as.character(ftab$Colours), colorkey=list(space="right", labels=list(rot=0))) + 
+    latticeExtra::layer(sp.polygons(land_simple, lty=2)) +
+    latticeExtra::layer(sp.points(subset(allinit, Hour < tstart | Hour > tend), pch=1, cex=0.8, col="black")) +
+    latticeExtra::layer(sp.points(subset(allinit, Hour >= tstart & Hour <= tend), pch=3, cex=1, col="black")) +
+    latticeExtra::layer(sp.polygons(spp))
+
+tps <- list(superpose.symbol=list(col='black', pch=c(3,1)))
+trellis.par.set(tps)
+lp <- update(lp, key=simpleKey(text = c("Afternoon (13-18H)","Other (0-13H & 18-24H)"), space="top"))
+print(lp)
+
+```
+
+```{r Figure5a, fig.height=6, fig.width=9}
+require(ggplot2)
+
+# Get the distance to the boundary
+r <- gridDistance(ancils$mycl.f, origin=4)/1000
+rz <- trim(raster::mask(r, ancils$mycl.z))
+allinit$dist2bnd <- extract(x = r, y = allinit)
+aftinit$dist2bnd <- extract(x = r, y = aftinit)
+
+# Split the hours into groups ...
+allinit$HourGroup <- NA
+allinit$HourGroup[allinit$Hour >= 1 & allinit$Hour <= 3] <- "Night"
+allinit$HourGroup[allinit$Hour >= 7 & allinit$Hour <= 9] <- "Morning"
+allinit$HourGroup[allinit$Hour >= 15 & allinit$Hour <= 17] <- "Afternoon"
+allinit$HourGroup[allinit$Hour >= 18 & allinit$Hour <= 20] <- "Evening"
+allinit$HourGroup <- factor(allinit$HourGroup, levels=c("Morning", "Afternoon", "Evening","Night"))
+
+ggplot(data=allinit@data[which(!is.na(allinit@data$HourGroup)),], aes(x=dist2bnd, colour=HourGroup)) + geom_density()
+
+ggplot(data=allinit@data[which(!is.na(allinit@data$HourGroup)),], aes(x=dist2bnd, colour=HourGroup)) + geom_density() + scale_x_log10()
+
+ggplot(data=allinit@data[which(!is.na(allinit@data$HourGroup)),], aes(x=dist2bnd, fill=HourGroup)) + geom_bar(position="dodge", binwidth=5)
+
+# Bootstrap samples to give expected + error bars
+bs_dist <- data.frame(Rep=integer(), nSample=integer(), Dist=numeric())
+for (n in c(20, 70,144, 353)){
+    for (x in 1:100){
+        bs_dist <- rbind(bs_dist, data.frame(Rep=x, nSample=n, Dist=sampleRandom(rz, size = n)))
+    }    
+}
+
+bs_dist$nSamplef <- factor(bs_dist$nSample)
+ggplot(data=bs_dist, aes(x=Dist, group=nSamplef)) + geom_density(aes(colour=nSamplef))
+
+```
+
+But, the traditional bootstrap approach assumes that there is complete spatial randomness in the point process. We know from the following that the data is clustered...
+
+```{r Figure5b, fig.height=6, fig.width=9}
+X <- as.ppp(allinit[,"Hour"])
+miplot(unmark(X))
+```
+
+So, the above means that within any network of boxes (each with size 4 degrees square or less), the points will be clustered. This means that any random sampling of points within the domain needs to account for the spatial structure of the points. 
+
+```{r Figure5c, fig.height=6, fig.width=9}
+fit_th <- kppm(unmark(X), ~1, "Thomas", statistic="pcf")
+fit_mc <- kppm(unmark(X), ~1, "MatClust")
+
+plot(envelope(fit_th, Lest, nsim=100))
+plot(envelope(fit_mc, Lest, nsim=100))
+
+fit_thsim_xy <- lapply(simulate(fit_th, nsim=100), FUN = function(x)return(data.frame(x=x$x, y=x$y)))
+
+sim_dist2bnd <- data.frame(ID=integer, dist=numeric, dens=numeric)
+for (i in 1:length(fit_thsim_xy)){
+    dist2bnd <- density(extract(rz, fit_thsim_xy[[i]], df=F), na.rm=T, bw=10, from=0, to=100)
+    sim_dist2bnd <- rbind(sim_dist2bnd, data.frame(ID=i, dist=dist2bnd$x, dens=dist2bnd$y))
+}
+
+sim_dist2bnd_smry <- data.frame(x=numeric, y_mean=numeric, y_min=numeric, y_max=numeric)
+for (x in unique(sim_dist2bnd$dist)){
+    dens <- sim_dist2bnd[sim_dist2bnd$dist == x, "dens"]
+    sim_dist2bnd_smry <- rbind(sim_dist2bnd_smry, data.frame(x=x, 
+                              y_mean=mean(dens, na.rm=T), 
+                              y_min=mean(dens, na.rm=T) - (1.96 * sd(dens, na.rm=T)), 
+                              y_max=mean(dens, na.rm=T) + (1.96 * sd(dens, na.rm=T))))
+}
+
+mod_data <- as.data.frame(density(extract(rz, aftinit, df=F), na.rm=T, bw=10, from=0, to=100)[c("x","y")])
+pltdata <- rbind(cbind(id="Cluster process model", sim_dist2bnd_smry), data.frame(id="Model convective initiations", x=mod_data$x, y_mean=mod_data$y, y_min=NA, y_max=NA))
+print(
+    ggplot(data=pltdata, aes(x=x, group=id)) +
+        geom_ribbon(aes(ymin=y_min, ymax=y_max), fill="grey") +
+        geom_line(aes(y=y_mean, colour=id)) +
+        scale_colour_manual(values=c("black","red")) +
+        theme(legend.title=element_blank()) +
+        labs(title="Density of initiation points by distance to boundary", x="Distance to boundary (km)", y="Density")
+    
+)
+
+```
+
+```{r hovmoller, fig.height=7, fig.width=6}
+
+allinit$timestep <- as.POSIXct(allinit$timestep)
+
+
+m <- ggplot(allinit@data, aes(x=x, y=timestep, z=dist2bnd)) 
+
+m + stat_summary2d(aes(fill=cut(..value.., breaks=c(-0.01,10,seq(20,100,20), 150), labels=c("0 - 10", "10 - 20", "20 - 40", "40 - 60", "60 - 80", "80 - 100", "100 - 150"))), binwidth=c(1,10800), fun=median) + 
+    scale_fill_brewer(palette = "RdYlGn", name="Distance (km)") +
+    geom_point() +
+    labs(title="Median distance to boundary of initiation points", x="Longitude", y="Time")
+
+m + stat_summary2d(aes(fill=..value..), binwidth=c(1,10800), fun=function(x)sqrt(var(x))) + 
+    scale_fill_contbrewerpb(pal = "RdYlGn", name="Standard\nDeviation", limits = c(0,65)) +
+    geom_point() +
+    labs(title="Standard deviation in distance to boundary of initiation points", x="Longitude", y="Time")
+
+
+```
+
+```{r randomSampleFromSimualtions}
+
+
+mybootstrap <- function(results_ll, lc=4, t=c(tstart:tend), mycl.f=ancils$mycl.f, nsims=500){
+    results_ll_ss <- subset(results_ll, Hour %in% t & Landcover == lc & Zone > 0 & class == "Generation")
+    X <- as.ppp(results_ll_ss[,"Hour"])
+    fit_mc <- kppm(unmark(X), ~1, "MatClust")
+    
+    simpts <- data.frame("x"=numeric(), "y"=numeric(), "sim"=integer())
+    n <- nrow(results_ll_ss)
+    for (x in 1:nsims){
+        sim <- simulate(fit_mc)
+        i <- sample(1:length(sim[[1]]$x), n, replace=T)
+        simpts <- rbind(simpts, data.frame("x"=sim[[1]]$x[i], "y"=sim[[1]]$y[i], "sim"=x))
+    }
+    simpts$Landcover <- extract(mycl.f, simpts[,c("x","y")])
+    sim_lccount <- table(simpts[,c("sim","Landcover")], useNA = "ifany")
+    sim_lcfracs <- sim_lccount / rowSums(sim_lccount)
+    
+    lc_i <- which(levels(mycl.f)[[1]]$ID %in% lc)
+    sim_lcfrac_mean <- mean(sim_lcfracs[,lc_i])
+    sim_lcfrac_lo <- sim_lcfrac_mean - (1*sd(sim_lcfracs[,lc_i]))
+    sim_lcfrac_hi <- sim_lcfrac_mean + (1*sd(sim_lcfracs[,lc_i]))
+
+    return(list(lo=sim_lcfrac_lo, mm=sim_lcfrac_mean, hi=sim_lcfrac_hi))
+}
+
+
+```
+
+```{r distanceToCoast}
+land_forcoast <- rasterize(ancils$land_simple, landfrac, field="SQKM")
+dist_tocoast  <- gridDistance(land_forcoast, origin=NA)
+allinit$dist2coast <- extract(dist_tocoast, allinit)
+r <- gridDistance(ancils$mycl.f, origin=4)/1000
+allinit$dist2bnd <- extract(x = r, y = allinit)
+
+# Plot afternoon initiations over distance to coastline
+levelplot(dist_tocoast/1000, at=seq(0,2500,250), col.regions = colorRampPalette(brewer.pal(n=9, "PuBuGn"))) + layer(sp.polygons(ancils$land_simple, col="black")) + layer(sp.points(subset(allinit_ge20mins, Hour >= 13 & Hour <= 17), pch=3, col="dark grey")) + layer(sp.points(subset(allinit_ge20mins, Hour >= 13 & Hour <= 17 & Landcover == 4), pch=3, col="red"))
+
+# For how long does a precip patch have to exist before we count it in the stats?
+# ie: If we remove all precip patches that initiate and die out within X mins, how significant is the boundary effect?
+pval_df <- data.frame(x=integer(), y=numeric(), n=integer())
+for (x in 1:100){
+    id_geXmins <- as.integer(names(id_count[id_count >= x]))
+    allinit_geXmins <- subset(allinit, ID %in% id_geXmins)
+    inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, allinit_geXmins, tstart, tend, maxID, selclass, masked=masked)
+    nicetable <- inittable$nicetable
+    pval_df <- rbind(pval_df, data.frame(x=x, y=nicetable[1,"AftPvalues"], n=nicetable[1,"AftInitCount"]))
+}
+ggplot(pval_df, aes(x=x*5, y=y)) + geom_line() + geom_hline(yintercept=0.05, linetype=3, colour="red") + scale_x_continuous(breaks=c(seq(0,100,20),seq(150,500,50))) + labs(title="Is the number of afternoon initiations over tree:grass boundaries significantly different to the expected number?\nHow does the p-value change if we exclude convective cells with a duration of less than x minutes?", y="p-value", x="Duration of a convective cell (mins)")
+
+ggplot(pval_df, aes(x=x*5, y=n)) + geom_line() + scale_x_continuous(breaks=c(seq(0,100,20),seq(150,500,50))) + labs(title="Number of initiations using different convective cell duration thresholds", x="Duration of convective cell (mins)", y="Count")
+
+# Remove all initiations that last for less than 30 minutes
+genIDs <- as.integer(names(table(results_ll$ID)))
+id_count <- sort(table(results_ll@data[results_ll$ID %in% genIDs,"ID"]))
+id_ltXmins <- as.integer(names(id_count[id_count < 6]))
+id_geXmins <- as.integer(names(id_count[id_count >= 6]))
+allinit_geXmins <- subset(allinit, ID %in% id_geXmins)
+allinit_ltXmins <- subset(allinit, ID %in% id_ltXmins)
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, allinit_geXmins, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+nicetable
+
+# Where are the points that we removed?
+levelplot(dist_tocoast/1000, at=seq(0,2500,250), col.regions = colorRampPalette(brewer.pal(n=9, "PuBuGn"))) + 
+    latticeExtra::layer(sp.polygons(ancils$land_simple, col="black")) + 
+    latticeExtra::layer(sp.points(subset(allinit_ltXmins, Hour >= 13 & Hour <= 17 & Landcover == 4), pch=3, col="dark grey")) + 
+    latticeExtra::layer(sp.points(subset(allinit_geXmins, Hour >= 13 & Hour <= 17 & Landcover == 4), pch=3, col="red"))
+
+
+```
+
+```{r defaultBoundarySettings_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```

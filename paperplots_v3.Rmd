@@ -1,0 +1,807 @@
+---
+title: "Paper Plots v3"
+author: "Andy Hartley"
+date: "6 January 2015"
+output:
+  html_document:
+    theme: journal
+    toc: yes
+---
+
+This document has all the plots that go into the paper.
+
+
+```{r setup, include=FALSE, cache=FALSE}
+#knitr::opts_chunk$set(cache=FALSE)
+library(raster)
+library(rasterVis)
+library(latticeExtra)
+library(rgdal)
+library(knitr)
+library(spatstat)
+library(ggplot2)
+library(gridExtra)
+library(gtable)
+source("functions/loadAllAncils.R")
+source("functions/loadVeg.R") # Returns myveg = fractional veg cover for each pft tile
+source("functions/loadOtherAncils.R")
+source("functions/makeBoxes.R") 
+source("functions/vegPrep.R") # Returns allveg = vegetation classess (1 to 6) AND veg classes intersected with zones (i.e. boxes)
+source("functions/patches.R")
+source("functions/mcsStats.R")
+source("functions/popStats.R")
+source("functions/initiations.R")
+source("functions/makeLines.R")
+source("getMyData.R")
+source("trackCheck.R")
+source("functions/saveSpatial.R")
+source('~/Scripts/R/scale_fill_contbrewerpb.R')
+source('functions/plotBars2.R')
+source("functions/MaskPrecip.R")
+source("functions/subsetHours.R")
+source('functions/rp2ll.R')
+
+if (Sys.info()[["sysname"]] == "Darwin"){
+    indatadir <- "/Users/ajh235/Work/DataLocal/ModelData/WAFR/"
+    dlresultsdir <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/Users/ajh235/Work/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/Users/ajh235/Work/Scratch/"
+} else {
+    indatadir <- "/data/local/hadhy/ModelData/WAFR/"
+    dlresultsdir <- "/data/local/hadhy/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/home/h02/hadhy/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/data/local/hadhy/Scratch/"
+    require(PP,lib.loc="/project/ukmo/rhel6/R")
+}
+
+rasterOptions(tmpdir=scratchdir, todisk=F)
+```
+
+```{r setup_vars, cache=FALSE}
+timestep <- "5min" # "10min" # "avg"
+threshold <- 1000 # Threshold for minimum size of an MCS
+myproj <- "ll" # Should be "ll" for paper
+models <- c("rb5216.4km.std", "rb5216.4km.50k", "rb5216.4km.300k")[1] # [2:3]
+id <- "s" # c("s","w","y")#[2:3]
+
+# Get precip data
+mydata <- getMyData(timestep=timestep, var="lsrain", overwrite=F)
+rb5216.4km.std <- adjCoords(mydata)
+
+# land_simple <- readOGR(dsn=paste(indatadir,"ancils",sep=""), layer="land_ll") # Lat Long
+ancils_rp <- loadAllAncils(myproj="rp", nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=0.3, bndDef=2, nBuf=3, overwrite=F)
+spp        <- ancils$spp
+spp.r      <- ancils$spp.r
+myveg      <- ancils$myveg
+mylandfrac <- ancils$mylandfrac
+myorog     <- ancils$myorog
+mycl       <- ancils$mycl
+mycl.f     <- ancils$mycl.f
+mycl.z     <- ancils$mycl.z
+land_simple<- ancils$land_simple
+
+myLUT <- data.frame(ID=c(1,2,3,4,7), Landcover=factor(c("tree", "grass", "sparse", "boundary", "orography"), levels=c("tree", "grass", "sparse", "boundary", "orography")[c(3,2,4,1,5)]), Colours=c("dark green", "yellow", "orange", "sienna", "dark grey"), plotOrder=c(4,2,1,3,5))
+
+mycl.1b <- mycl
+mycl.1b[mycl.1b == 5] <- 4
+mycl.1b[mycl.1b == 6] <- 4
+mycl.1bf <- as.factor(mycl.1b)
+ftab <- myLUT[myLUT$ID %in% levels(mycl.f)[[1]]$ID, ]
+levels(mycl.1bf) <- ftab
+
+# Load bt_results_new - see check_backtracked2.Rmd
+outresults_file <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/backtracked_results_1000km_5min_POP1t_removed.Rdata"
+load(outresults_file)
+idfreq <- table(bt_results_new[,"ID"])
+idgt1 <- as.numeric(attributes(idfreq[!(idfreq == 1)])$dimnames[[1]])
+bt_results <- bt_results_new[bt_results_new$ID %in% idgt1,]
+coordinates(bt_results) <- ~x+y
+
+results_ll <- readOGR(dsn='/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/LatLongMapData/', layer="bt_results_POP1t_removed_ll")
+
+# Function for figures 5 & 6
+facet_names <- list('% Tree'='%', '% Grass'='%', '% Boundary'='%', '% Orography'='%', '% Ocean'='%', "Total MCS Precipitation"="Total", "Total Small-Scale Precipitation"="Total")
+facet_labeller <- function(variable,value){
+  return(facet_names[value])
+}
+
+```
+
+```{r functions, include=FALSE, cache=TRUE}
+
+testSig <- function(intable, inarea, testtype="poisson", cl=0.9){
+    pvals <- vector("numeric")
+    lowci <- vector("numeric")
+    uppci <- vector("numeric")
+    for (x in 1:length(intable)){
+        if (testtype == "poisson"){
+            xpval <- poisson.test(x=c(intable[x],sum(intable[-x], na.rm=T)), T=c(inarea[x], sum(inarea[-x], na.rm=T)), alternative="greater", conf.level=cl)$p.value            
+        } 
+        if (testtype == 'binom'){
+            xpval <- round(binom.test(x=intable[x], n=sum(intable, na.rm=T), p=inarea[x]/sum(inarea, na.rm=T), alternative="two.sided", conf.level=cl)$p.value, 5)
+            xlowci <- round(100*as.numeric(binom.test(x=intable[x], n=sum(intable, na.rm=T), p=inarea[x]/sum(inarea, na.rm=T), alternative="two.sided", conf.level=cl)$conf.int[1]), 1)
+            xuppci <- round(100*as.numeric(binom.test(x=intable[x], n=sum(intable, na.rm=T), p=inarea[x]/sum(inarea, na.rm=T), alternative="two.sided", conf.level=cl)$conf.int[2]), 1)
+        }
+        pvals <- c(pvals, xpval)
+        lowci <- c(lowci, xlowci)
+        uppci <- c(uppci, xuppci)
+    }
+    return(list(pvals=pvals, lowci=lowci, uppci=uppci))
+}
+
+getInitTable <- function(mycl.f, mycl.z, results_ll, tstart, tend, maxID, selclass, masked=TRUE){
+    # Total Land Area per veg class
+    if (masked){
+        mycl.f <- raster::mask(mycl.f, mycl.z)        
+    } 
+    areasqkm <- raster::area(mycl.f)
+    
+    mycl.f.area <- round(zonal(areasqkm, mycl.f, fun='sum'))
+    nicetable <- data.frame("ID"=mycl.f.area[,"zone"], "class"=as.character(myLUT[match(mycl.f.area[,"zone"], myLUT$ID), "Landcover"]), "AreaSQKM"=mycl.f.area[,"sum"], "Percent"=round(100*mycl.f.area[,"sum"] / sum(mycl.f.area), 1))
+    
+    ## Next, get the initiations within the study zone
+    # All initiations
+    allinit <- subset(results_ll, ID <= maxID & class == selclass)
+    # MCS Initiations in the afternoon / evening 
+    aftinit <- subset(results_ll, ID <= maxID & class == selclass & Hour >= tstart & Hour <= tend,)
+    
+    # Extract classes for init points
+    allinit$Landcover <- extract(mycl.f, allinit)
+    aftinit$Landcover <- extract(mycl.f, aftinit)
+    
+    
+    # How many initiations over boundaries at all times of day?
+    allinit.count <- table(allinit$Landcover) # Count per class
+    allinit.perc  <- round(100 * allinit.count / sum(allinit.count) , 1) # %
+    #allinit.bndsize <- as.numeric(allinit.count[which(as.numeric(names(allinit.count)) == 4)])
+    #allinit.uncert<- bootStrap(indata=allinit$class, size=allinit.bndsize, reps=1000)
+    allinit_testSig_results <- testSig(allinit.count, mycl.f.area[,"sum"], testtype="binom", cl=0.9)
+    allinit.pvals <- allinit_testSig_results[["pvals"]]
+    allinit.lowci <- allinit_testSig_results[["lowci"]]
+    allinit.uppci <- allinit_testSig_results[["uppci"]]
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(allinit.count)))
+    
+    nicetable_all <- data.frame(class=myLUT[myi,"Landcover"], AllInitCount=as.vector(allinit.count), AllInitLowCI=as.vector(allinit.lowci), AllInitPercent=as.vector(allinit.perc), AllInitUppCI=as.vector(allinit.uppci), AllPvalues=allinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_all, by="class", all.x=T)
+    
+    # Setup dataset for ggplot
+    freqdata <- data.frame(table(allinit@data[!is.na(allinit$Landcover),"Hour"]))
+    
+    # How many initiations over boundaries between tstart and tend? 
+    aftinit.count <- table(aftinit$Landcover) # Count per class
+    aftinit.perc  <- round(100 * aftinit.count / sum(aftinit.count) , 1) # %
+    aftinit_testSig_results<- testSig(aftinit.count, mycl.f.area[,"sum"], testtype="binom", cl=0.9)
+    aftinit.pvals <- aftinit_testSig_results[["pvals"]]
+    aftinit.lowci <- aftinit_testSig_results[["lowci"]]
+    aftinit.uppci <- aftinit_testSig_results[["uppci"]]
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(aftinit.count)))
+    nicetable_aft <- data.frame(class=myLUT[myi,"Landcover"], AftInitCount=as.vector(aftinit.count), AftInitLowCI=as.vector(aftinit.lowci), AftInitPercent=as.vector(aftinit.perc), AftInitUppCI=as.vector(aftinit.uppci), AftPvalues=aftinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_aft, by="class", all.x=T)
+
+    return(list(nicetable=nicetable, mycl.f.area=mycl.f.area, freqdata=freqdata, allinit=allinit[!is.na(allinit$Landcover),], aftinit=aftinit[!is.na(aftinit$Landcover),]))
+}
+```
+
+
+## Figure 1. Vegetation classes and numbered zones
+
+```{r figure_1, fig.height=6, fig.width=9, cache=TRUE}
+
+levelplot(mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.polygons(spp)) +
+    latticeExtra::layer(sp.text(loc=coordinates(spp), txt=1:nrow(spp@data), cex=3))
+```
+
+## Table 1. Initiations by Vegetation Type
+
+The boundary thresholds are setup as follows:
+
+**bndDef** = Threshold pixels above which a boundary is defined. If a 3x3 window contains > bndDef pixels of tree and > bndDef pixels of grass, then the centre of the matrix is defined as a boundary pixel. This is then used in the buffering of boundaries (see nBuf). Values: 1, or 2 (results in >1 or >2). Default=2
+
+**nBuf** = Dimensions of the shifting window for identifying buffers. E.g. nBuf=3 means a 3x3 shifting window. If 1 boundary pixel is within a 3x3 window, the centre of that matrix is classified as boundary. In a 4km dataset, nBuf=3 means that Values: either 3, 5, or 7. Default=3
+
+**nBndClass** = Number of boundary classes. Values: either 1 or 3. Default=1
+
+
+```{r defaultBoundarySettings_setup, cache=TRUE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultBoundarySettings_loadData, include=FALSE, cache=TRUE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+# Get distance to coast and bnd for each point
+land_forcoast <- rasterize(ancils$land_simple, ancils$landfrac, field="SQKM")
+dist_tocoast  <- gridDistance(land_forcoast, origin=NA)
+dist_tobnd <- gridDistance(ancils$mycl.f, origin=4)/1000
+
+# Extract info to add to results
+results_ll$Landcover <- extract(ancils$mycl.f, results_ll)
+results_ll$Zone      <- extract(ancils$spp.r, results_ll)
+results_ll$dist2coast <- extract(dist_tocoast, results_ll)
+results_ll$dist2bnd <- extract(dist_tobnd, results_ll)
+
+# Remove all initiations that last for less than 30 minutes
+genIDs <- as.integer(names(table(results_ll$ID)))
+id_count <- sort(table(results_ll@data[results_ll$ID %in% genIDs,"ID"]))
+id_ltXmins <- as.integer(names(id_count[id_count < 6]))
+id_geXmins <- as.integer(names(id_count[id_count >= 6]))
+results_ll_geXmins <- subset(results_ll, ID %in% id_geXmins)
+results_ll_ltXmins <- subset(results_ll, ID %in% id_ltXmins)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll_geXmins, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+```
+
+```{r defaultBoundarySettings_printTable, results='asis', cache=TRUE}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+### Area stats
+
+There are `r format(sum(mycl.f.area), big.mark = ",", scientific=F)` km2 in the study area (i.e. zones 1 to 15)
+
+There are `r sum(table(extract(mycl.z, allinit)))` initiations altogether, and `r sum(table(extract(mycl.z, aftinit)))` initiations in the afternoon period (`r tstart` to `r tend`).
+
+Total number of MCS recorded : `r nrow(subset(results_ll, Zone > 0 & class == "MCS Generation")@data)`
+
+### Expected numbers compared to observed
+
+There are `r 100*(nicetable[1,"AftInitCount"] - (sum(nicetable[,"AftInitCount"])*nicetable[1,"Percent"]/100)) / (sum(nicetable[,"AftInitCount"])*nicetable[1,"Percent"]/100)`% more convective initiations over `r nicetable[1,"class"]` cover during the afternoon period
+
+Lower estimate: `r 100*((sum(nicetable[,"AftInitCount"])*nicetable[1,"AftInitLowCI"]/100) - (sum(nicetable[,"AftInitCount"])*nicetable[1,"Percent"]/100)) / (sum(nicetable[,"AftInitCount"])*nicetable[1,"Percent"]/100)`%
+
+Upper estimate: `r 100*((sum(nicetable[,"AftInitCount"])*nicetable[1,"AftInitUppCI"]/100) - (sum(nicetable[,"AftInitCount"])*nicetable[1,"Percent"]/100)) / (sum(nicetable[,"AftInitCount"])*nicetable[1,"Percent"]/100)`%
+
+There are `r 100*(nicetable[5,"AftInitCount"] - (sum(nicetable[,"AftInitCount"])*nicetable[5,"Percent"]/100)) / (sum(nicetable[,"AftInitCount"])*nicetable[5,"Percent"]/100)`% more convective initiations over `r nicetable[5,"class"]` cover during the afternoon period
+
+Lower estimate: `r 100*((sum(nicetable[,"AftInitCount"])*nicetable[5,"AftInitLowCI"]/100) - (sum(nicetable[,"AftInitCount"])*nicetable[5,"Percent"]/100)) / (sum(nicetable[,"AftInitCount"])*nicetable[5,"Percent"]/100)`%
+
+Upper estimate: `r 100*((sum(nicetable[,"AftInitCount"])*nicetable[5,"AftInitUppCI"]/100) - (sum(nicetable[,"AftInitCount"])*nicetable[5,"Percent"]/100)) / (sum(nicetable[,"AftInitCount"])*nicetable[5,"Percent"]/100)`%
+
+
+## Figure 2. Frequency of initiations at all times of day for each veg class
+```{r figure_2, fig.height=6, fig.width=9, cache=TRUE}
+
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=factor(Hour))) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of convective initiations by time of day and vegetation class", x="Time of day", y="Count") + facet_grid(classnames ~ .)
+```
+
+## Figure 3. Map of afternoon initiations over land cover classes
+```{r figure_3, fig.height=6, fig.width=9, cache=TRUE}
+lp <- levelplot(mycl.1bf, att="Landcover", maxpixels=600000, main=paste("Convective Initiations Over Vegetation Classes", sep=""), xlim=c(-12,10), ylim=c(4,18), xlab=NULL, ylab=NULL, col.regions=as.character(ftab$Colours), colorkey=list(space="right", labels=list(rot=0))) + 
+    latticeExtra::layer(sp.polygons(land_simple, lty=2)) +
+    latticeExtra::layer(sp.text(loc=coordinates(spp), txt=1:nrow(spp@data), cex=3, col='black', fontface='bold', alpha=0.6)) +
+    latticeExtra::layer(sp.points(subset(allinit, Hour < tstart | Hour > tend), pch=3, cex=0.8, col="black")) +
+    latticeExtra::layer(sp.points(subset(allinit, Hour >= tstart & Hour <= tend), pch=1, cex=0.9, col="black")) +
+    latticeExtra::layer(sp.polygons(spp))
+
+tps <- list(superpose.symbol=list(col='black', pch=c(1,3)))
+trellis.par.set(tps)
+lp <- update(lp, key=simpleKey(text = c("Afternoon (13-18H)","Other (0-13H & 18-24H)"), space="top"))
+print(lp)
+
+```
+
+
+## Figure 4. How do initiations vary according to longitude and time?
+```{r hovmoller_lon, fig.height=7, fig.width=6, cache=TRUE}
+# NB: allinit is actually allinit_geXmins ...
+allinit$timestep <- as.POSIXct(allinit$timestep)
+allinit$LonZone <- extract(ancils$spp.r, allinit)
+allinit$LonZone <- ifelse(allinit$LonZone > 5 & allinit$LonZone <= 10, allinit$LonZone - 5, allinit$LonZone)
+allinit$LonZone <- ifelse(allinit$LonZone > 10 & allinit$LonZone <= 15, allinit$LonZone - 10, allinit$LonZone)
+allinit$LonZone <- factor(allinit$LonZone, labels = c("11W - 7W","7W - 3W","3W - 1E", "1E - 5E","5E - 9E"))
+
+m <- ggplot(allinit@data, aes(x=x, y=timestep, z=dist2bnd)) 
+m + stat_summary2d(aes(fill=cut(..value.., breaks=c(-0.01,5,10,20,40,60,100,150), labels=c("0 - 5", "5 - 10", "10 - 20", "20 - 40", "40 - 60", "60 - 100", "100 - 150"))), binwidth=c(1,10800), fun=median) + 
+    scale_fill_manual(values = brewer.pal(n=7,name="RdYlGn"), name="Distance (km)") +
+    geom_point(aes(shape=LonZone)) + 
+    labs(title="Median distance to boundary of initiation points", x="Longitude", y="Time")
+
+m <- ggplot(allinit@data, aes(x=y, y=timestep, z=dist2bnd)) 
+m + stat_summary2d(aes(fill=cut(..value.., breaks=c(-0.01,5,10,20,40,60,100,150), labels=c("0 - 5", "5 - 10", "10 - 20", "20 - 40", "40 - 60", "60 - 100", "100 - 150"))), binwidth=c(1,10800), fun=median) + 
+    scale_fill_manual(values = brewer.pal(n=7,name="RdYlGn"), name="Distance (km)") +
+    geom_point(aes(shape=LonZone)) +
+    scale_x_continuous(breaks=seq(5,17,2)) +
+    labs(title="Median distance to boundary of initiation points", y="Time", x="Latitude")
+
+```
+
+```{r Figure4_hovmoller_lat, fig.height=6, fig.width=7.6, cache=TRUE}
+m <- ggplot(allinit@data, aes(x=timestep, y=y, z=dist2bnd)) 
+m + stat_summary2d(aes(fill=cut(..value.., breaks=c(-0.01,5,10,20,40,60,100,150), labels=c("0 - 5", "5 - 10", "10 - 20", "20 - 40", "40 - 60", "60 - 100", "100 - 150"))), binwidth=c(10800,1), fun=median) + 
+    geom_point(aes(shape=LonZone)) +
+    scale_fill_manual(values = brewer.pal(n=7,name="RdYlGn"), name="Distance (km)") +
+    scale_shape_discrete(name="Longitudinal\nZone") +
+    scale_x_datetime(breaks=as.POSIXct("2006-08-16 00:00:00 BST") + (0:8)*60*60*12, labels=c('00:00\nAug 16','12:00','00:00\nAug 17', '12:00', '00:00\nAug 18', '12:00', '00:00\nAug 19', '12:00', '00:00\nAug 20')) +
+    scale_y_continuous(breaks=seq(5,17,2)) +
+    labs(title="Median distance to boundary of initiation points", x="Time", y="Latitude")
+
+```
+
+Maybe I need to include a density plot here to go below this hovmoller (see sample code in hovmoller_digressions)
+
+## Figure 5. Mean precipitation rate by landcover class and zone
+```{r Figure5_plotBars_setup, fig.height=6, fig.width=9, cache=TRUE, include=FALSE}
+
+#### NB: Analysis in Rotated Pole projection so it doesn't involve resampling 
+######## BUT : Rotated Pole grid is quite different to Lat Long grid
+
+mcs.infile <- paste(indatadir,"djzxs/patches/",threshold,"km_",timestep,"/allmcs.1000km.vrt", sep="")
+pop.infile <- paste(indatadir,"djzxs/patches/",threshold,"km_",timestep,"/allpop.1000km.vrt", sep="")
+mcs <- adjCoords(stack(mcs.infile)) # Adjusts coords if needed
+pop <- adjCoords(stack(pop.infile))
+
+tot.pr.5min.mcs.f <- paste(indatadir, "djzxs/derived/tot.precip.",timestep,".mcs.",threshold,"km.tif",sep="")
+tot.pr.5min.pop.f <- paste(indatadir, "djzxs/derived/tot.precip.",timestep,".pop.",threshold,"km.tif",sep="")
+tot.pr.5min.mcs <- MaskPrecip(rb5216.4km.std, mcs, tot.pr.5min.mcs.f, overwrite=F)*60*5
+tot.pr.5min.pop <- MaskPrecip(rb5216.4km.std, pop, tot.pr.5min.pop.f, overwrite=F)*60*5
+tot.pr.5min.mcs_ll <- rp2ll(adjCoords(tot.pr.5min.mcs), ancils, gsub(x = tot.pr.5min.mcs.f, pattern = ".tif", replacement = "_ll.tif"))
+tot.pr.5min.pop_ll <- rp2ll(adjCoords(tot.pr.5min.pop), ancils, gsub(x = tot.pr.5min.pop.f, pattern = ".tif", replacement = "_ll.tif"))
+
+######################################################################################
+# This gives accumulated MCS precip and accumulated POP precip between 15:00 and 21:00
+plen <- 6
+hr <- 21
+myss <- subsetHours(rb5216.4km.std, hr=hr, plen=plen)[[1]]
+phr <- subsetHours(rb5216.4km.std, hr=hr, plen=plen)[[2]]
+pr.tmp <- subset(stack(rb5216.4km.std), myss)
+mcs.tmp <- subset(stack(mcs), myss)
+pop.tmp <- subset(stack(pop), myss)
+
+# Total number of MCS and POP during the afternoon
+mcs.tmp.sum.f <- paste(indatadir, "/djzxs/derived/mcs.tmp.sum.",timestep,".",threshold,"km.",hr,"_",plen,"_ll.tif",sep="")
+pop.tmp.sum.f <- paste(indatadir, "/djzxs/derived/pop.tmp.sum.",timestep,".",threshold,"km.",hr,"_",plen,"_ll.tif",sep="")
+if (!file.exists(mcs.tmp.sum.f) | !file.exists(pop.tmp.sum.f) | overwrite){
+    mcs.tmp.sum <- sum(mcs.tmp, na.rm=T)
+    pop.tmp.sum <- sum(pop.tmp, na.rm=T)
+    mcs.tmp.sum_ll <- rp2ll(adjCoords(mcs.tmp.sum), ancils, mcs.tmp.sum.f)
+    pop.tmp.sum_ll <- rp2ll(adjCoords(pop.tmp.sum), ancils, pop.tmp.sum.f)
+} else {
+    mcs.tmp.sum_ll <- raster(mcs.tmp.sum.f)
+    pop.tmp.sum_ll <- raster(pop.tmp.sum.f)
+}
+
+# Do the masking for the subset of hours
+pr.sum.mcs.f <- paste(indatadir, "/djzxs/derived/pr.sum.mcs.",timestep,".",threshold,"km.",hr,"_",plen,".tif",sep="")
+pr.sum.pop.f <- paste(indatadir, "/djzxs/derived/pr.sum.pop.",timestep,".",threshold,"km.",hr,"_",plen,".tif",sep="")
+pr.sum.mcs <- MaskPrecip(pr.tmp, mcs.tmp, pr.sum.mcs.f, overwrite=F)*60*5
+pr.sum.pop <- MaskPrecip(pr.tmp, pop.tmp, pr.sum.pop.f, overwrite=F)*60*5
+pr.sum.mcs_ll <- rp2ll(adjCoords(pr.sum.mcs),ancils, gsub(x = pr.sum.mcs.f, pattern = ".tif", replacement = "_ll.tif"), overwrite=F)
+pr.sum.pop_ll <- rp2ll(adjCoords(pr.sum.pop),ancils, gsub(x = pr.sum.pop.f, pattern = ".tif", replacement = "_ll.tif"), overwrite=F)
+
+# We also want to show underneath p1 the following:
+# - % orograhy
+# - % sea
+# - total precip
+# Shown as coloured squares, with the number overlaid
+outdf <- data.frame(Zone=integer(), Variable=character(), Value=numeric())
+for (i in 1:15){
+    print(i)
+    curr_zone <- extent(subset(ancils$spp, layer == i))
+    zone_ncell<- ncell(crop(ancils$spp.r, curr_zone))
+    classfreq <- as.data.frame(freq(crop(ancils$mycl, curr_zone)))
+    tree  <- round(100 * as.integer(subset(classfreq, value == 1, count)) / zone_ncell, 1)
+    grass <- round(100 * as.integer(subset(classfreq, value == 2, count)) / zone_ncell, 1)
+    bnd   <- round(100 * as.integer(subset(classfreq, value == 4, count)) / zone_ncell, 1)
+    orog  <- round(100 * as.integer(subset(classfreq, value == 7, count)) / zone_ncell, 1)
+    ocean <- round(100 * cellStats(crop(is.na(land_forcoast), curr_zone), 'sum') / zone_ncell, 1)
+    tot_precip_mcs <- round(100 * cellStats(crop(pr.sum.mcs_ll, curr_zone), 'sum') / zone_ncell, 1)
+    tot_precip_pop <- round(100 * cellStats(crop(pr.sum.pop_ll, curr_zone), 'sum') / zone_ncell, 1)
+    outdf <- rbind(outdf, data.frame(Zone=i, Variable="% Tree", Value=tree))
+    outdf <- rbind(outdf, data.frame(Zone=i, Variable="% Grass", Value=grass))
+    outdf <- rbind(outdf, data.frame(Zone=i, Variable="% Boundary", Value=bnd))
+    outdf <- rbind(outdf, data.frame(Zone=i, Variable="% Orography", Value=orog))
+    outdf <- rbind(outdf, data.frame(Zone=i, Variable="% Ocean", Value=ocean))
+    outdf <- rbind(outdf, data.frame(Zone=i, Variable="Total MCS Precipitation", Value=tot_precip_mcs))
+    outdf <- rbind(outdf, data.frame(Zone=i, Variable="Total Small-Scale Precipitation", Value=tot_precip_pop))
+}
+
+```
+
+```{r Figure5_alt_plotBars, fig.width=9, fig.height=7, cache=FALSE}
+
+mcs_sum <- raster(mcs[[1]])
+mcs_sum[] <- 0
+for (x in 1:nlayers(mcs)){ 
+    mcs[[x]][is.na(mcs[[x]])] = 0
+    mcs_sum <- mcs_sum + mcs[[x]]
+}
+mcs_sum.f <- "/Users/ajh235/Work/DataLocal/ModelData/WAFR//djzxs/derived/mcs.sum.5min.1000km.allday_ll.tif"
+mcs_sum_ll <- rp2ll(adjCoords(mcs_sum), ancils, mcs_sum.f)
+p1 <- plotBars2(mcs_sum_ll*5, ancils$mycl.z, mytitle=paste("Total time (mins) under MCS\nnormalised by zonal area of class",sep=""), ylab="Mean Time (mins)")
+
+p2 <- ggplot(subset(outdf, Variable != "Total Small-Scale Precipitation"), aes(x=Zone, y=Value, fill=Variable)) + 
+        geom_bar(stat="identity") + 
+        facet_grid(Variable ~ . , scales = "free_y", labeller=facet_labeller) + 
+        scale_fill_manual(name="legend", values=c(as.character(myLUT$Colours[c(1,2,4,5)]), brewer.pal(5, "GnBu")[3], "Blue"), labels=c("Tree","Grass","Boundary","Orography", "Ocean", "Precip")) +
+        scale_x_discrete(breaks=seq(1,15,1)) + 
+        coord_cartesian(xlim=c(0.4,15.6))
+#p2 <- p2 + annotation_custom(grob = textGrob(label = c('(b)','','','','',''), hjust = 0, gp = gpar(cex = 1.5)), ymin = 30, ymax = 30, xmin = -1, xmax = -1)
+outdf_forleg <- rbind(outdf, data.frame("Zone"=1:15, "Variable"="% Sparse", "Value"=0))
+p3_forleg <- ggplot(subset(outdf_forleg, Variable != "Total Small-Scale Precipitation"), aes(x=Zone, y=Value, fill=Variable)) + 
+        geom_bar(stat="identity") + 
+        facet_grid(Variable ~ . , scales = "free_y") + 
+        scale_fill_manual(name="", values=c(as.character(myLUT$Colours[c(1,2,3,4,5)]), brewer.pal(5, "GnBu")[3], "Blue"), labels=c("Tree","Grass","Sparse","Boundary","Orography", "Ocean", "MCS\nPrecipitation"))
+
+require(gridExtra)
+g_legend<-function(p1){
+tmp1 <- ggplotGrob(p1)
+leg1 <- which(sapply(tmp1$grobs, function(x) x$name) == "guide-box")
+legend1 <- tmp1$grobs[[leg1]]
+return(legend1)}
+
+legend <- g_legend(p3_forleg)
+lwidth <- sum(legend$width)
+
+# axis.text.x=element_blank(), axis.ticks.x=element_blank(), 
+gA <- ggplotGrob(p1+ theme(legend.position="none", axis.title.x=element_blank(), plot.margin = unit( c(0,0,0,0) , units = "lines" )))
+gB <- ggplotGrob(p2 + theme(legend.position="none", plot.margin = unit( c(0,0,0,0) , units = "lines" )))
+maxWidth = grid::unit.pmax(gA$widths[2:5], gB$widths[2:5])
+gA$widths[2:5] <- as.list(maxWidth)
+gB$widths[2:5] <- as.list(maxWidth)
+
+gA <- gtable_add_cols(gA, gB$widths[5])
+gB$widths <- gA$widths
+grid.arrange(arrangeGrob(gA, gB, heights=c(3/5,2/5), ncol=1), legend, widths=unit.c(unit(1, "npc") - lwidth, lwidth), nrow=1)
+
+
+```
+
+
+```{r Figure5_plotBars_plotting, fig.width=9, fig.height=7, cache=FALSE}
+
+p1 <- plotBars2(mcs.tmp.sum_ll, ancils$mycl.z, mytitle=paste("Total time (mins) under MCS\n",phr,":00 to ",hr,":00 normalised by zonal area of class",sep=""), ylab="Mean Time (mins)")
+#p1 <- p1 + annotation_custom(grob = textGrob(label = '(a)', hjust = 0, gp = gpar(cex = 1.5)), ymin = 30, ymax = 30, xmin = -1, xmax = -1)
+p2 <- ggplot(subset(outdf, Variable != "Total Small-Scale Precipitation"), aes(x=Zone, y=Value, fill=Variable)) + 
+        geom_bar(stat="identity") + 
+        facet_grid(Variable ~ . , scales = "free_y", labeller=facet_labeller) + 
+        scale_fill_manual(name="legend", values=c(as.character(myLUT$Colours[c(1,2,4,5)]), brewer.pal(5, "GnBu")[3], "Blue"), labels=c("Tree","Grass","Boundary","Orography", "Ocean", "Precip")) +
+        scale_x_discrete(breaks=seq(1,15,1)) + 
+        coord_cartesian(xlim=c(0.4,15.6))
+#p2 <- p2 + annotation_custom(grob = textGrob(label = c('(b)','','','','',''), hjust = 0, gp = gpar(cex = 1.5)), ymin = 30, ymax = 30, xmin = -1, xmax = -1)
+outdf_forleg <- rbind(outdf, data.frame("Zone"=1:15, "Variable"="% Sparse", "Value"=0))
+p3_forleg <- ggplot(subset(outdf_forleg, Variable != "Total Small-Scale Precipitation"), aes(x=Zone, y=Value, fill=Variable)) + 
+        geom_bar(stat="identity") + 
+        facet_grid(Variable ~ . , scales = "free_y") + 
+        scale_fill_manual(name="", values=c(as.character(myLUT$Colours[c(1,2,3,4,5)]), brewer.pal(5, "GnBu")[3], "Blue"), labels=c("Tree","Grass","Sparse","Boundary","Orography", "Ocean", "MCS\nPrecipitation"))
+
+require(gridExtra)
+g_legend<-function(p1){
+tmp1 <- ggplotGrob(p1)
+leg1 <- which(sapply(tmp1$grobs, function(x) x$name) == "guide-box")
+legend1 <- tmp1$grobs[[leg1]]
+return(legend1)}
+
+legend <- g_legend(p3_forleg)
+lwidth <- sum(legend$width)
+
+# axis.text.x=element_blank(), axis.ticks.x=element_blank(), 
+gA <- ggplotGrob(p1+ theme(legend.position="none", axis.title.x=element_blank(), plot.margin = unit( c(0,0,0,0) , units = "lines" )))
+gB <- ggplotGrob(p2 + theme(legend.position="none", plot.margin = unit( c(0,0,0,0) , units = "lines" )))
+maxWidth = grid::unit.pmax(gA$widths[2:5], gB$widths[2:5])
+gA$widths[2:5] <- as.list(maxWidth)
+gB$widths[2:5] <- as.list(maxWidth)
+
+gA <- gtable_add_cols(gA, gB$widths[5])
+gB$widths <- gA$widths
+grid.arrange(arrangeGrob(gA, gB, heights=c(3/5,2/5), ncol=1), legend, widths=unit.c(unit(1, "npc") - lwidth, lwidth), nrow=1)
+
+
+levelplot(crop(tot.pr.5min.mcs_ll, extent(ancils$spp)), at=c(0,5,25,50,100,200,450), col.regions = brewer.pal(6,"PuBu"), main="Total MCS precipitation All Day", margin=FALSE) + latticeExtra::layer(sp.polygons(ancils$spp)) + latticeExtra::layer(sp.polygons(ancils$land_simple))
+levelplot(crop(mcs.tmp.sum_ll, extent(ancils$spp))*5, at=c(0,5,25,50,100,200,1000), col.regions = brewer.pal(6,"PuBu"), main="Total time (mins) under MCS 15:00 to 21:00", margin=FALSE) + latticeExtra::layer(sp.polygons(ancils$spp)) + latticeExtra::layer(sp.polygons(ancils$land_simple))
+levelplot(crop(pr.sum.mcs_ll, extent(ancils$spp)), at=c(0,5,25,50,100,200,450), col.regions = brewer.pal(6,"PuBu"), main="Total MCS precipitation 15:00 to 21:00", margin=FALSE) + latticeExtra::layer(sp.polygons(ancils$spp)) + latticeExtra::layer(sp.polygons(ancils$land_simple))
+
+```
+
+## Figure 6. Small Scale Precipitation by zone, normalised by area of class within each zone
+
+```{r Figure6_plots, fig.width=9, fig.height=7, cache=FALSE}
+
+p1 <- plotBars2(pr.sum.pop_ll, ancils$mycl.z, mytitle=paste("Accumulated Small-Scale Precipitation\nbetween ",phr,":00 and ",hr,":00 normalised by zonal area of class",sep=""), ylab="Precipitation (mm/hour)")
+
+p2 <- ggplot(subset(outdf, Variable != "Total MCS Precipitation"), aes(x=Zone, y=Value, fill=Variable)) + 
+        geom_bar(stat="identity") + 
+        facet_grid(Variable ~ . , scales = "free_y", labeller=facet_labeller) + 
+        scale_fill_manual(values=c(as.character(myLUT$Colours[c(1,2,4,5)]), brewer.pal(5, "GnBu")[3], "Blue")) +
+        #guides(fill=FALSE) + 
+        scale_x_discrete(breaks=seq(1,15,1)) + 
+        coord_cartesian(xlim=c(0.4,15.6)) #+
+        #theme(strip.background = element_blank(), strip.text.y = element_blank())
+
+outdf_forleg <- rbind(outdf, data.frame("Zone"=1:15, "Variable"="% Sparse", "Value"=0))
+p3_forleg <- ggplot(subset(outdf_forleg, Variable != "Total MCS Precipitation"), aes(x=Zone, y=Value, fill=Variable)) + 
+        geom_bar(stat="identity") + 
+        facet_grid(Variable ~ . , scales = "free_y") + 
+        scale_fill_manual(name="", values=c(as.character(myLUT$Colours[c(1,2,3,4,5)]), brewer.pal(5, "GnBu")[3], "Blue"), labels=c("Tree","Grass","Sparse","Boundary","Orography", "Ocean", "Small-Scale\nPrecipitation"))
+
+
+g_legend<-function(p1){
+tmp1 <- ggplotGrob(p1)
+leg1 <- which(sapply(tmp1$grobs, function(x) x$name) == "guide-box")
+legend1 <- tmp1$grobs[[leg1]]
+return(legend1)}
+
+legend <- g_legend(p3_forleg)
+lwidth <- sum(legend$width)
+
+# axis.text.x=element_blank(), axis.ticks.x=element_blank(), 
+gA <- ggplotGrob(p1+ theme(legend.position="none", axis.title.x=element_blank(), plot.margin = unit( c(0,0,0,0) , units = "lines" )))
+gB <- ggplotGrob(p2 + theme(legend.position="none", plot.margin = unit( c(0,0,0,0) , units = "lines" )))
+maxWidth = grid::unit.pmax(gA$widths[2:5], gB$widths[2:5])
+gA$widths[2:5] <- as.list(maxWidth)
+gB$widths[2:5] <- as.list(maxWidth)
+
+gA <- gtable_add_cols(gA, gB$widths[5])
+gB$widths <- gA$widths
+grid.arrange(arrangeGrob(gA, gB, heights=c(3/5,2/5), ncol=1), legend, widths=unit.c(unit(1, "npc") - lwidth, lwidth), nrow=1)
+
+
+levelplot(crop(tot.pr.5min.pop_ll, extent(ancils$spp)), at=c(0,5,25,50,100,200,450), col.regions = brewer.pal(6,"PuBu"), main="Total Small-Scale Precipitation All Times of Day", margin=FALSE) + latticeExtra::layer(sp.polygons(ancils$spp)) + latticeExtra::layer(sp.polygons(ancils$land_simple))
+levelplot(crop(pop.tmp.sum_ll, extent(ancils$spp))*5, at=c(0,5,25,50,100,200,1000), col.regions = brewer.pal(6,"PuBu"), main="Total time (mins) under Small-Scale Precipitation 15:00 to 21:00", margin=FALSE) + latticeExtra::layer(sp.polygons(ancils$spp)) + latticeExtra::layer(sp.polygons(ancils$land_simple))
+levelplot(crop(pr.sum.pop_ll, extent(ancils$spp)), at=c(0,5,25,50,100,200,450), col.regions = brewer.pal(6,"PuBu"), main="Total Small-Scale Precipitation 15:00 to 21:00", margin=FALSE) + latticeExtra::layer(sp.polygons(ancils$spp)) + latticeExtra::layer(sp.polygons(ancils$land_simple))
+
+
+```
+
+## Figure 7. MCS Tracks Over Vegetation Classes
+
+```{r Figure7a, fig.width=9, fig.height=6, cache=FALSE}
+
+# Output results file
+current <- "20112014" # format(Sys.time(), "%d%m%Y")
+all_overlaps_rdata <- paste("/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/all_overlaps_",current,".RData", sep="")
+
+# Get Dates
+gcd <- getCorrectDates(rb5216.4km.std)
+alldates <- gcd[[1]]
+
+count_perID <- aggregate(count ~ ID, data=all_overlaps, FUN=sum)
+count_perID <- count_perID[order(count_perID$count),]
+iend <- length(count_perID$ID)
+trackIDs <- count_perID[(iend-20):iend,"ID"]
+
+mylines <- makeLines_v2(subset(all_overlaps, ID %in% trackIDs))
+mylines <- subset(mylines$ll, ClusterID < 888000)
+
+# Remove some IDs with only 1 point
+ikeep <- vector("integer")
+for (x in 1:length(mylines@lines)){
+    if (length(unlist(coordinates(mylines[x,]))) > 2){
+        ikeep <- append(ikeep, x)
+    }
+}
+mylines <- mylines[ikeep,]
+
+# Remove some lines that don't spend much time within the study area
+mylines <- mylines[!mylines@data$ClusterID %in% c(3, 80, 239, 677, 696, 335, 582, 609, 121, 402, 412, 730, 774, 775, 1043),]
+start_pts <- matrix(unlist(lapply(coordinates(mylines), FUN = function(x){x[[1]][1,]})), ncol=2, byrow = T)
+
+# Plot the tracks
+levelplot(ancils$mycl.f, att="Landcover", maxpixels=6000000, main=paste("MCS Tracks Over Vegetation Classes", sep=""), xlim=c(-12,10), ylim=c(4,18), xlab=NULL, ylab=NULL, col.regions=as.character(ftab$Colours), colorkey=list(space="right", labels=list(rot=0))) + 
+    latticeExtra::layer(sp.polygons(land_simple, lty=2)) +
+    latticeExtra::layer(sp.lines(mylines)) +
+    latticeExtra::layer(sp.text(loc = start_pts, txt = mylines@data$ClusterID, col="red"))
+
+
+levelplot(crop(ancils$myveg[[1]], extent(ancils$spp)), margin=F, col.regions=brewer.pal(n = 5, name = "Greens"), at=seq(0,1,0.2)) + 
+    latticeExtra::layer(sp.polygons(ancils$land_simple, col="dark grey")) + 
+    latticeExtra::layer(sp.lines(mylines)) +
+    latticeExtra::layer(sp.text(loc = start_pts, txt = mylines@data$ClusterID, col="dark red", font=2))
+```
+
+
+```{r Figure7b_setup, cache=TRUE, include=FALSE}
+mcsrst.path <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/Tracking/djzxs_1000km_5min/"
+inthr <- 10
+
+# Loop through each track
+for (ii in mylines$ClusterID){
+    
+    mydates <- subset(all_overlaps, ID == ii, "timestep")[,1]
+    if (exists("mydf")){ rm(mydf) }
+    
+    print(paste("MCS: ",ii, "; ",length(mydates)," timesteps",sep=" "))
+    
+    for (x in 1:length(mydates)){
+        
+        print(x)
+        mcs.now <- adjCoords(raster(paste(mcsrst.path,"mcs_tracking_1000km_",format(mydates[x], "%d.%H%M"), ".tif",sep="")))
+        
+        mcsiinow <- mcs.now == ii
+        mcsiinow[mcsiinow == 0] <- NA
+        precip.now <- adjCoords(rb5216.4km.std[[which(getZ(rb5216.4km.std) == mydates[x])]])
+        
+        # Mask precip that's not in the MCS
+        mcsprecip   <- raster::mask(precip.now, mcsiinow)*3600 # mm per hour every 5 mins
+
+        # Where the rainfall is most intense, what's the rate over grass and the rate over tree?
+        # 1. Classify intense rain (>20mm)
+        mcsprecip.intense <- calc(mcsprecip, fun=function(x){x[x<inthr]<-NA; return(x)})
+        
+        # 2. Mask veg classes to intense precip patches
+        mycl.mask <- raster::mask(ancils_rp$mycl, mcsprecip.intense)
+        
+        # Check that some cells have data in ...
+        haveData <- length(which(is.na(getValues(mycl.mask)))) != ncell(mycl.mask)
+        
+        if (haveData){
+            
+            # Write all data to a big dataframe
+            loc <- which(!is.na(getValues(mcsprecip.intense)))
+            prvals <- getValues(mcsprecip.intense)[loc]
+            clvals <- getValues(mycl.mask)[loc]
+            if (!exists("bigdata")){
+                bigdata <- data.frame("ID"=ii, "time"=mydates[x], "TOD"=format(mydates[x], "%H:%M"), "Precip"=prvals, "Class"=clvals)
+            } else {
+                bigdata <- rbind(bigdata, data.frame("ID"=ii, "time"=mydates[x], "TOD"=format(mydates[x], "%H:%M"), "Precip"=prvals, "Class"=clvals))
+            }
+            
+            # 3. Zonal mean and std dev 
+            cl.mean <- zonal(mcsprecip.intense, ancils_rp$mycl, fun='mean')
+            cl.std  <- zonal(mcsprecip.intense, ancils_rp$mycl, fun='sd')
+            cl.se  <- zonal(mcsprecip.intense, ancils_rp$mycl, fun=function(x, na.rm=T){x <- x[!is.na(x)]; return(sd(x)/sqrt(length(x)))})
+            cl.len  <- freq(mycl.mask, useNA="no")
+            
+            zon.stats <- data.frame(cl.mean, std=cl.std[,2], se=cl.se[,2], count=NA)
+            zon.stats[which(cl.mean[,"zone"] %in% cl.len[,"value"]),"count"] <- cl.len[,"count"]
+            zon.stats$landcover <- c("tree","grass","sparse","boundary", "orography") 
+            
+            # 4. Add results to a data.frame
+            newdata <- data.frame(ID=ii, zon.stats[,c("zone","mean")], sdmin=zon.stats[,"mean"]-zon.stats[,"std"], sdmax=zon.stats[,"mean"]+zon.stats[,"std"], se=zon.stats[,"se"], zon.stats[,c("count","landcover")], time=mydates[x])
+            if (!exists("mydf")){
+                mydf <- newdata
+            } else {
+                mydf <- rbind(mydf, newdata)
+            }
+            rm(newdata)
+        } else {
+            print("We don\'t have any data for this timestep")
+        }
+        
+    } # End of dates loop
+    
+    if (exists("mydf")){
+        if (length(unique(mydf$time))>3){
+            # Plot results for this MCS
+            mydf$landcover <- factor(x=mydf$landcover, levels=c("sparse", "grass","boundary", "tree", "orography"))
+            mydf$sdmin[mydf$sdmin < inthr] <- inthr
+            
+#             f2 <- ggplot(mydf, aes(x=time, group=landcover, fill=landcover))
+#             p2 <- f2 + geom_ribbon(aes(ymin=mean-se, ymax=mean+se), alpha=0.3) + geom_line(aes(y=mean, colour=landcover)) + scale_colour_manual(values = c("orange","yellow","brown","dark green","dark grey")) + scale_fill_manual(values = c("orange","yellow","brown","#31a354","dark grey")) + labs(title=paste("MCS Mean Intense Precipitation (>",inthr,"mm) by Land Cover Type\nMCS id:",ii), y=expression(mm~hour^-1), x="Time")
+#             
+#             p3 <- f2 + geom_line(aes(y=count, colour=landcover)) + scale_colour_manual(values = c("orange","yellow","brown","dark green","dark grey")) + labs(title=paste("Grid Cell Count of Intense Precipitation (>",inthr,"mm) per Land Cover Type",sep=""), y="Grid cells", x="Time")
+#             
+#             #         multiplot(p2, p3, layout=layout)
+#             print(p2)
+#             print(p3)
+            
+            if(!exists("mybigdf")){
+                mybigdf <- mydf
+            } else {
+                mybigdf <- rbind(mybigdf, mydf)
+            }
+            
+            rm(mydf)
+            
+        }
+    }
+    
+#     browser()
+    
+} # End of ii
+
+
+```
+
+```{r Figure7b_plots, fig.width=12, fig.height=9, cache=FALSE}
+
+ggplot(mybigdf, aes(x=time, group=landcover, fill=landcover)) +
+    geom_ribbon(aes(ymin=mean-se, ymax=mean+se), alpha=0.3) + 
+    geom_line(aes(y=mean, colour=landcover)) + 
+    facet_wrap( ~ ID, ncol=1) +
+    coord_cartesian(ylim=c(0,150)) +
+#    scale_y_continuous(ylim=c(0,150)) +
+    scale_colour_manual(values = c("orange","yellow","brown","dark green","dark grey")) + 
+    scale_fill_manual(values = c("orange","yellow","brown","#31a354","dark grey")) + 
+    labs(title=paste("MCS Mean Intense Precipitation (>",inthr,"mm) by Land Cover Type"), y=expression("Precipitation ("~mm~hour^-1~")"), x="Time")
+
+
+gp1 <- ggplot(subset(mybigdf, ID %in% c(154,171,379)), aes(x=time, group=landcover, fill=landcover)) +
+geom_ribbon(aes(ymin=mean-se, ymax=mean+se), alpha=0.3) +
+geom_line(aes(y=mean, colour=landcover)) +
+facet_wrap( ~ ID, ncol=1) +
+coord_cartesian(ylim=c(0,100)) +
+scale_colour_manual(values = c("orange","yellow","brown","dark green","dark grey")) +
+scale_fill_manual(values = c("orange","yellow","brown","#31a354","dark grey")) +
+labs(y=expression("Precipitation ("~mm~hour^-1~")"), x="Time") + # title=paste("MCS Mean Intense Precipitation (>",inthr,"mm) by Land Cover Type"), 
+    theme(legend.position="none")
+
+gp2 <- ggplot(subset(mybigdf, ID %in% c(558,643,942)), aes(x=time, group=landcover, fill=landcover)) +
+geom_ribbon(aes(ymin=mean-se, ymax=mean+se), alpha=0.3) +
+geom_line(aes(y=mean, colour=landcover)) +
+facet_wrap( ~ ID, ncol=1) +
+coord_cartesian(ylim=c(0,100)) +
+scale_colour_manual(values = c("orange","yellow","brown","dark green","dark grey")) +
+scale_fill_manual(values = c("orange","yellow","brown","#31a354","dark grey")) +
+labs(y=expression("Precipitation ("~mm~hour^-1~")"), x="Time") + # title=paste("MCS Mean Intense Precipitation (>",inthr,"mm) by Land Cover Type"), 
+    theme(legend.position="none")
+
+grid.arrange(gp1, gp2 + theme(axis.ticks.y=element_blank(), axis.text.y=element_blank(), axis.title.y=element_blank()), ncol=2)
+
+
+```
+
+
+
+### Some alternatives to figure 4
+```{r hovmoller_digressions, fig.height=7, fig.width=6, cache=TRUE, include=FALSE}
+m <- ggplot(allinit@data, aes(x=x, y=timestep, z=dist2bnd)) 
+m + stat_summary2d(aes(fill=cut(..value.., breaks=c(-0.01,5,10,20,40,60,100,150), labels=c("0 - 5", "5 - 10", "10 - 20", "20 - 40", "40 - 60", "60 - 100", "100 - 150"))), binwidth=c(1,10800), fun=mean) + 
+    scale_fill_manual(values = brewer.pal(n=7,name="RdYlGn"), name="Distance (km)") +
+    geom_point() +
+    labs(title="Mean distance to boundary of initiation points", x="Longitude", y="Time")
+
+m + stat_summary2d(aes(fill=cut(..value.., breaks=c(-0.01,5,10,20,40,60,100,150), labels=c("0 - 5", "5 - 10", "10 - 20", "20 - 40", "40 - 60", "60 - 100", "100 - 150"))), binwidth=c(1,10800), fun=modal) + 
+    scale_fill_manual(values = brewer.pal(n=7,name="RdYlGn"), name="Distance (km)") +
+    geom_point() +
+    labs(title="Most common distance to boundary of initiation points", x="Longitude", y="Time")
+
+m <- ggplot(allinit@data, aes(x=x, y=timestep, z=Landcover))
+m + stat_summary2d(fun=modal, binwidth=c(1,10800), aes(fill=cut(..value.., breaks=c(0.5,1.5,2.5,3.5,4.5,7.5), labels=c("tree","grass","sparse","boundary","orography"), ordered=TRUE))) +
+    scale_fill_manual(values=as.character(myLUT$Colours), name="Land cover class") +
+    geom_point() +
+    labs(title="Most common land cover class of initiation points", x="Longitude", y="Time")
+
+bndcount <- function(x){length(which(x==4))}
+bndperc  <- function(x){100 * length(which(x==4)) / length(x)}
+
+m + stat_summary2d(fun=bndperc, binwidth=c(1,10800), aes(fill=cut(..value.., breaks=c(-0.01,40,60,80,90,100.1), labels=c("0 - 40", "40 - 60", "60 - 80", "80 - 90", "90 - 100")))) +
+    scale_fill_manual(values = colorRampPalette(brewer.pal(n=9,name="RdPu")[-9])(7), name="Distance (km)") +
+    geom_point() +
+    labs(title="Percentage of initiation points that are on a tree:grass boundary", x="Longitude", y="Time")
+
+m + stat_summary2d(fun=bndperc, binwidth=c(1,10800)) +
+    scale_fill_contbrewerpb(pal = "RdPu", limits=c(0,100), name="Percentage") +
+    geom_point() +
+    labs(title="Percentage of initiation points that are on a tree:grass boundary", x="Longitude", y="Time")
+
+m + stat_summary2d(fun=bndcount, binwidth=c(1,10800)) +
+    scale_fill_contbrewerpb(pal = "RdPu", limits=c(0,8), name="Count") +
+    geom_point() +
+    labs(title="Number of initiation points that are on a tree:grass boundary", x="Longitude", y="Time")
+
+ggplot(allinit@data, aes(x=y, colour=Zone)) + 
+    geom_density(adjust=1, aes(y=..count..), na.rm=T) +
+    scale_x_continuous(breaks=seq(5,17,2)) +
+    labs(x="Latitude", y="Count", title="Latitudinal Variation in Convective Initiations")
+
+ggplot(allinit@data, aes(x=timestep, colour=Zone)) +
+    geom_density(adjust=1, aes(y=..count..), na.rm=T) +
+    labs(x="Time", y="Count", title="Temporal Variation in Convective Initiations")
+
+```
+

@@ -1,0 +1,1014 @@
+---
+title: "Boundary Tests"
+author: "Andy Hartley"
+date: "29 August 2014"
+output:
+  html_document:
+    theme: journal
+    toc: yes
+---
+
+This document is for testing different boundary configurations to go into the paper.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=FALSE)
+library(raster)
+library(rasterVis)
+library(rgdal)
+library(knitr)
+source("functions/loadAllAncils.R")
+source("functions/loadVeg.R") # Returns myveg = fractional veg cover for each pft tile
+source("functions/loadOtherAncils.R")
+source("functions/makeBoxes.R") 
+source("functions/vegPrep.R") # Returns allveg = vegetation classess (1 to 6) AND veg classes intersected with zones (i.e. boxes)
+source("functions/patches.R")
+source("functions/mcsStats.R")
+source("functions/popStats.R")
+source("functions/initiations.R")
+source("functions/makeLines.R")
+source("getMyData.R")
+source("trackCheck.R")
+source("functions/saveSpatial.R")
+
+if (Sys.info()[["sysname"]] == "Darwin"){
+    indatadir <- "/Users/ajh235/Work/DataLocal/ModelData/WAFR/"
+    dlresultsdir <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/Users/ajh235/Work/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/Users/ajh235/Work/Scratch/"
+} else {
+    indatadir <- "/data/local/hadhy/ModelData/WAFR/"
+    dlresultsdir <- "/data/local/hadhy/Projects/InternalSabbatical/Results/"
+    resultsdir <- "/home/h02/hadhy/Projects/InternalSabbatical/Results/"
+    scratchdir <- "/data/local/hadhy/Scratch/"
+    require(PP,lib.loc="/project/ukmo/rhel6/R")
+}
+
+rasterOptions(tmpdir=scratchdir, todisk=F)
+
+timestep <- "5min" # "10min" # "avg"
+threshold <- 1000
+myproj <- "ll" # Should be "ll" for paper
+models <- c("rb5216.4km.std", "rb5216.4km.50k", "rb5216.4km.300k")[1] # [2:3]
+id <- "s" # c("s","w","y")#[2:3]
+
+# Get precip data
+mydata <- getMyData(timestep=timestep, var="lsrain", overwrite=F)
+rb5216.4km.std <- mydata
+
+# land_simple <- readOGR(dsn=paste(indatadir,"ancils",sep=""), layer="land_ll") # Lat Long
+
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=0.3, bndDef=2, nBuf=3, overwrite=F)
+spp        <- ancils$spp
+spp.r      <- ancils$spp.r
+myveg      <- ancils$myveg
+mylandfrac <- ancils$mylandfrac
+myorog     <- ancils$myorog
+mycl       <- ancils$mycl
+mycl.f     <- ancils$mycl.f
+mycl.z     <- ancils$mycl.z
+land_simple<- ancils$land_simple
+
+myLUT <- data.frame(ID=c(1,2,3,4,7), Landcover=factor(c("tree", "grass", "sparse", "boundary", "orography"), levels=c("tree", "grass", "sparse", "boundary", "orography")[c(3,2,4,1,5)]), Colours=c("dark green", "yellow", "orange", "sienna", "dark grey"), plotOrder=c(4,2,1,3,5))
+
+mycl.1b <- mycl
+mycl.1b[mycl.1b == 5] <- 4
+mycl.1b[mycl.1b == 6] <- 4
+mycl.1bf <- as.factor(mycl.1b)
+ftab <- myLUT[myLUT$ID %in% levels(mycl.f)[[1]]$ID, ]
+levels(mycl.1bf) <- ftab
+
+# Load bt_results_new - see check_backtracked2.Rmd
+outresults_file <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/backtracked_results_1000km_5min_POP1t_removed.Rdata"
+load(outresults_file)
+
+results_ll <- readOGR(dsn='/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/LatLongMapData/', layer="bt_results_POP1t_removed_ll")
+
+```
+
+```{r functions, include=FALSE, cache=FALSE}
+
+bootStrap <- function(indata, size, reps){
+    # indata = all raster values
+    # size   = 
+    indata <- indata[!is.na(indata)]
+    size <- length(indata)
+    bootresults <- vector("list")
+    for (r in 1:reps){
+        bootresults[[r]] <- table(sample(indata, size, replace=TRUE))
+    }
+    return(bootresults)
+}
+
+
+testSig <- function(intable, inarea, testtype="poisson"){
+    pvals <- vector("numeric")
+    for (x in 1:length(intable)){
+        if (testtype == "poisson"){
+            xpval <- poisson.test(x=c(intable[x],sum(intable[-x], na.rm=T)), T=c(inarea[x], sum(inarea[-x], na.rm=T)), alternative="greater", conf.level=0.95)$p.value            
+        } 
+        if (testtype == 'binom'){
+            xpval <- binom.test(x=intable[x], n=sum(intable, na.rm=T), p=inarea[x]/sum(inarea, na.rm=T), alternative="greater")$p.value
+        }
+        pvals <- c(pvals, xpval)
+    }
+    return(round(pvals, 5))
+}
+
+getInitTable <- function(mycl.f, mycl.z, results_ll, tstart, tend, maxID, selclass, masked=TRUE){
+    # Total Land Area per veg class
+    if (masked){
+        mycl.f <- mask(mycl.f, mycl.z)        
+    } 
+    areasqkm <- raster::area(mycl.f)
+
+    mycl.f.area <- round(zonal(areasqkm, mycl.f, fun='sum'))
+    nicetable <- data.frame("ID"=mycl.f.area[,"zone"], "class"=as.character(myLUT[match(mycl.f.area[,"zone"], myLUT$ID), "Landcover"]), "AreaSQKM"=mycl.f.area[,"sum"], "Percent"=round(100*mycl.f.area[,"sum"] / sum(mycl.f.area), 1))
+    
+    ## Next, get the initiations within the study zone
+    # All initiations
+    allinit <- results_ll[results_ll$ID <= maxID & results_ll$class == selclass, ]
+    # MCS Initiations in the afternoon / evening 
+    aftinit <- results_ll[results_ll$ID <= maxID & results_ll$class == selclass & results_ll$Hour >= tstart & results_ll$Hour <= tend,]
+    
+    # Extract classes for init points
+    allinit$Landcover <- extract(mycl.f, allinit)
+    aftinit$Landcover <- extract(mycl.f, aftinit)
+    
+    # How many initiations over boundaries at all times of day?
+    allinit.count <- table(allinit$Landcover) # Count per class
+    allinit.perc  <- round(100 * allinit.count / sum(allinit.count) , 1) # %
+    #allinit.bndsize <- as.numeric(allinit.count[which(as.numeric(names(allinit.count)) == 4)])
+    #allinit.uncert<- bootStrap(indata=allinit$class, size=allinit.bndsize, reps=1000)
+    allinit.pvals <- testSig(allinit.count, mycl.f.area[,"sum"], testtype="binom")
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(allinit.count)))
+    
+    nicetable_all <- data.frame(class=myLUT[myi,"Landcover"], AllInitCount=as.vector(allinit.count), AllInitPercent=as.vector(allinit.perc), AllPvalues=allinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_all, by="class", all.x=T)
+    
+    # Setup dataset for ggplot
+    freqdata <- data.frame(table(allinit@data[!is.na(allinit$Landcover),"Hour"]))
+    
+    # How many initiations over boundaries between tstart and tend? 
+    aftinit.count <- table(aftinit$Landcover) # Count per class
+    aftinit.perc  <- round(100 * aftinit.count / sum(aftinit.count) , 1) # %
+    aftinit.pvals <- testSig(aftinit.count, mycl.f.area[,"sum"], testtype="binom")
+    
+    myi <- which(myLUT$ID %in% as.numeric(names(aftinit.count)))
+    nicetable_aft <- data.frame(class=myLUT[myi,"Landcover"], AftInitCount=as.vector(aftinit.count), AftInitPercent=as.vector(aftinit.perc), AftPvalues=aftinit.pvals)
+    
+    nicetable <- merge(nicetable, nicetable_aft, by="class", all.x=T)
+
+    return(list(nicetable=nicetable, mycl.f.area=mycl.f.area, freqdata=freqdata, allinit=allinit[!is.na(allinit$Landcover),], aftinit=aftinit[!is.na(aftinit$Landcover),]))
+}
+```
+
+
+## Figure 1. Vegetation classes and numbered zones
+
+```{r figure_1, fig.height=6, fig.width=9}
+require(rasterVis)
+levelplot(mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.polygons(spp)) +
+    latticeExtra::layer(sp.text(loc=coordinates(spp), txt=1:nrow(spp@data), cex=3))
+```
+
+## Table 1. Initiations by Vegetation Type
+
+Test different boundary setups ...
+
+**bndDef** = Threshold pixels above which a boundary is defined. If a 3x3 window contains > bndDef pixels of tree and > bndDef pixels of grass, then the centre of the matrix is defined as a boundary pixel. This is then used in the buffering of boundaries (see nBuf). Values: 1, or 2 (results in >1 or >2). Default=2
+
+**nBuf** = Dimensions of the shifting window for identifying buffers. E.g. nBuf=3 means a 3x3 shifting window. If 1 boundary pixel is within a 3x3 window, the centre of that matrix is classified as boundary. In a 4km dataset, nBuf=3 means that Values: either 3, 5, or 7. Default=3
+
+**nBndClass** = Number of boundary classes. Values: either 1 or 3. Default=1
+
+**p-values** = Probability that a value chosen at random will fall within the 95% confidence interval. Confidence intervals are calculated using a one-talied poisson test, by comparing the rate (initiations per km2 of a vegeation class) to the rate of all the other vegetation classes. If p-values are <0.05  
+
+### Default boundary settings
+
+```{r defaultBoundarySettings_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 14
+tend         <- 16
+selclass     <- "Generation"
+maxID        <- 1502 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultBoundarySettings_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r defaultBoundarySettings_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultBoundarySettings_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r defaultBoundarySettings_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+### Larger buffer for boundary
+
+```{r largerBuffer_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 5
+nBndClass    <- 1
+tstart       <- 14
+tend         <- 16
+selclass     <- "Generation"
+maxID        <- 1502 # 164700 or 1502
+masked       <- TRUE
+```
+
+
+```{r largerBuffer_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r largerBuffer_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r largerBuffer_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r largerBuffer_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+### Smaller buffer for boundary
+
+Here, there is no buffer around the boundary pixels. Also, using all initiation points slightly improves p-values (although still not significant)
+
+```{r smallerBuffer_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 1
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 16
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+
+```{r smallerBuffer_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r smallerBuffer_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r smallerBuffer_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r smallerBuffer_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+
+
+### Lowering boundary criteria
+
+Here, we only need >1 pixel of tree and >1 pixel of grass to define a boundary. Effectively, this gives boundaries in more places.
+
+```{r lowerBndCriteria_setup}
+vegThreshold <- 0.3
+bndDef       <- 1
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 14
+tend         <- 16
+selclass     <- "Generation"
+maxID        <- 1502 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r lowerBndCriteria_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r lowerBndCriteria_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r lowerBndCriteria_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r lowerBndCriteria_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+
+### Default boundary settings, but between 13:00 to 18:00
+
+```{r defaultSettings_13to18_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 1502 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettings_13to18_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+
+defSettings_13to18_mcsgen <- nicetable
+```
+
+```{r defaultSettings_13to18_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettings_13to18_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r defaultSettings_13to18_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+### Larger boundary buffer, and 13:00 to 18:00
+
+```{r largerBndBuffer_13to18_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 5
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 1502 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r largerBndBuffer_13to18_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r largerBndBuffer_13to18_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r largerBndBuffer_13to18_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r largerBndBuffer_13to18_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+### Lowering boundary criteria, and 13:00 to 18:00
+
+Here, we only need >1 pixel of tree and >1 pixel of grass to define a boundary. Effectively, this gives boundaries in more places.
+
+```{r lowerBndCriteria_13to18_setup}
+vegThreshold <- 0.3
+bndDef       <- 1
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 1502 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r lowerBndCriteria_13to18_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r lowerBndCriteria_13to18_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r lowerBndCriteria_13to18_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r lowerBndCriteria_13to18_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+### Lowering boundary criteria, increasing buffer size, and 13:00 to 18:00
+
+Here, we only need >1 pixel of tree and >1 pixel of grass to define a boundary. Effectively, this gives boundaries in more places.
+
+```{r lowerBndCriteria_largerBuffer_13to18_setup}
+vegThreshold <- 0.3
+bndDef       <- 1
+nBuf         <- 5
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 1502 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r lowerBndCriteria_largerBuffer_13to18_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r lowerBndCriteria_largerBuffer_13to18_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r lowerBndCriteria_largerBuffer_13to18_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+```{r lowerBndCriteria_largerBuffer_13to18_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+### Default boundary settings, all generations, between 13:00 to 18:00
+
+```{r defaultSettingsAllGenerations_13to18_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettingsAllGenerations_13to18_loadData, include=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+
+defSettings_13to18_allgen <- nicetable
+```
+
+```{r defaultSettingsAllGenerations_13to18_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettingsAllGenerations_13to18_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+### Default boundary settings, all generations, between 13:00 to 16:00
+
+```{r defaultSettingsAllGenerations_13to16_setup}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 15
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettingsAllGenerations_13to16_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+
+defSettings_13to16_allgen <- nicetable
+```
+
+```{r defaultSettingsAllGenerations_13to16_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettingsAllGenerations_13to16_printTable, results='asis'}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+
+```{r defaultSettingsAllGenerations_13to16_plotHist, fig.height=6, fig.width=9, fig.align='center'}
+require(ggplot2)
+# # How many initiations at different times of day?
+allinit@data$classnames <- myLUT[match(allinit@data$Landcover, myLUT$ID), "Landcover"]
+g <- ggplot(data=allinit@data, aes(x=Hour)) + stat_bin(binwidth=1, fill="white", colour="black")  
+g + labs(title="Frequency of MCS initiations by time of day and vegetation class", x="Time of day", y="Frequency") + facet_grid(classnames ~ .)
+```
+
+So, by including ALL generations (not just generations directly related to MCS), __we improve the p-value from `r defSettings_13to18_mcsgen[defSettings_13to18_mcsgen$class == "boundary","AftPvalues"]` to `r defSettings_13to18_allgen[defSettings_13to18_allgen$class == "boundary","AftPvalues"]`__ between the hours of 13:00 and 18:00. However, the improvement is not enough to achieve a significant result.
+
+If we shorten the period, to include only 13, 14 and 15 hours, __the p-value changes from `r defSettings_13to18_allgen[defSettings_13to18_allgen$class == "boundary","AftPvalues"]` to `r defSettings_13to16_allgen[defSettings_13to16_allgen$class == "boundary","AftPvalues"]`.__
+
+
+### Default boundary settings, but only 13:00
+
+```{r defaultSettings_13only_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 13
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettings_13only_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r defaultSettings_13only_plotMap, fig.height=6, fig.width=9, fig.align='center', cache=FALSE}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettings_13only_printTable, results='asis', cache=FALSE}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+### Default boundary settings, but only 14:00
+
+```{r defaultSettings_14only_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 14
+tend         <- 14
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettings_14only_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r defaultSettings_14only_plotMap, fig.height=6, fig.width=9, fig.align='center', cache=FALSE}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettings_14only_printTable, results='asis', cache=FALSE}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+### Default boundary settings, but only 15:00
+
+```{r defaultSettings_15only_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 15
+tend         <- 15
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettings_15only_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r defaultSettings_15only_plotMap, fig.height=6, fig.width=9, fig.align='center', cache=FALSE}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettings_15only_printTable, results='asis', cache=FALSE}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+### Default boundary settings, but only 16:00
+
+```{r defaultSettings_16only_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 16
+tend         <- 16
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettings_16only_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r defaultSettings_16only_plotMap, fig.height=6, fig.width=9, fig.align='center', cache=FALSE}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettings_16only_printTable, results='asis', cache=FALSE}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+
+### Default boundary settings, but only 17:00
+
+```{r defaultSettings_17only_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 17
+tend         <- 17
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultSettings_17only_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+nicetable <- inittable$nicetable
+mycl.f.area <- inittable$mycl.f.area
+freqdata <- inittable$freqdata
+allinit <- inittable$allinit
+aftinit <- inittable$aftinit
+
+initpts_ll <- results_ll[results_ll$ID <=maxID & results_ll$Hour >= tstart & results_ll$Hour <= tend & results_ll$class == selclass, ]
+```
+
+```{r defaultSettings_17only_plotMap, fig.height=6, fig.width=9, fig.align='center', cache=FALSE}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultSettings_17only_printTable, results='asis', cache=FALSE}
+kable(nicetable[order(myLUT$plotOrder),])
+```
+
+
+### Default boundary, each hour from 13 to 18, with all generations
+
+```{r defaultBnd_allgen_hourly_13to18_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 18
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultBnd_allgen_hourly_13to18_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+aftinit <- inittable$aftinit
+
+nicetable_p <- inittable$nicetable[,c("class","AreaSQKM","Percent","AftInitPercent","AftPvalues")]
+for (x in tstart:tend){
+    inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, x, x, maxID, selclass, masked=masked)
+    nicetable_p <- merge(nicetable_p, inittable$nicetable[,c("class","AftInitPercent","AftPvalues")], by="class", all.x=T)
+    colnames(nicetable_p)[ncol(nicetable_p)-1] <- paste("AftInitPc_",x,sep="")
+    colnames(nicetable_p)[ncol(nicetable_p)] <- paste("Pvalues_",x,sep="")
+}
+```
+
+```{r defaultBnd_allgen_hourly_13to18_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultBnd_allgen_hourly_13to18_printTable, results='asis', cache=FALSE}
+kable(nicetable_p[order(myLUT$plotOrder),])
+```
+
+
+### Larger boundary buffer, each hour from 13 to 18, with all generations
+
+```{r largerBndBuffer_allgen_hourly_13to18_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 5
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 18
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r largerBndBuffer_allgen_hourly_13to18_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=1, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, tstart, tend, maxID, selclass, masked=masked)
+aftinit <- inittable$aftinit
+
+nicetable_p <- inittable$nicetable[,c("class","AreaSQKM","Percent","AftInitPercent","AftPvalues")]
+for (x in tstart:tend){
+    inittable <- getInitTable(ancils$mycl.f, ancils$mycl.z, results_ll, x, x, maxID, selclass, masked=masked)
+    nicetable_p <- merge(nicetable_p, inittable$nicetable[,c("class","AftInitPercent","AftPvalues")], by="class", all.x=T)
+    colnames(nicetable_p)[ncol(nicetable_p)-1] <- paste("AftInitPc_",x,sep="")
+    colnames(nicetable_p)[ncol(nicetable_p)] <- paste("Pvalues_",x,sep="")
+}
+```
+
+```{r largerBndBuffer_allgen_hourly_13to18_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r largerBndBuffer_allgen_hourly_13to18_printTable, results='asis', cache=FALSE}
+kable(nicetable_p[order(myLUT$plotOrder),])
+```
+
+
+OK, from all of the above, we have learnt the following:
+
+* With default boundaries, results are only significant for 1pm, and even then the number of events is small (30 boundary initiations out of 95)
+
+* With enlarged boundaries (nBuf=5), we also get a significant result at 3pm. 
+
+* Summarising by afternoon or evening makes little difference to significance stats.
+
+* Despite this, there are some zones that do appear to have more initiations in the boundary class than others. So, the next step is to see if results are significant for certain grid cells during afternoon / evening period.
+
+### Default boundary, all generations, 13 to 18, BY ZONE
+
+```{r defaultBnd_allgen_13to18_byZone_setup, cache=FALSE}
+vegThreshold <- 0.3 
+bndDef       <- 2
+nBuf         <- 3
+nBndClass    <- 1
+tstart       <- 13
+tend         <- 18
+selclass     <- "Generation"
+maxID        <- 164700 # 164700 or 1502
+masked       <- TRUE
+```
+
+```{r defaultBnd_allgen_13to18_byZone_loadData, include=FALSE, cache=FALSE}
+ancils <- loadAllAncils(myproj=myproj, nBndClass=nBndClass, model="rb5216.4km.std", vegThreshold=vegThreshold, bndDef=bndDef, nBuf=nBuf, overwrite=F)
+
+#zones_sigtest <- vector("list")
+df <- data.frame(Zone=numeric(), class=character(), ID=integer(), AreaSQKM=integer(), Percent=numeric(), AllInitCount=integer(), AllInitPercent=numeric(), AllPvalues=numeric(), AftInitCount=integer(), AftInitPercent=numeric(), AftPvalues=numeric(), stringsAsFactors = F)
+for (z in unique(ancils$spp.r)){
+    print(z)
+    thiszone <- ancils$spp.r
+    thiszone[thiszone != z] <- NA
+    #plot(thiszone, main=paste("Zone",z))
+#     browser()
+#     if (z ==10){browser()}
+    inittable <- getInitTable(ancils$mycl.f, thiszone, results_ll, tstart, tend, maxID, selclass, masked=masked)
+    #zones_sigtest[[z]] <- cbind(Zone=z, inittable$nicetable) # [inittable$nicetable$ID == 4,]
+    df <- rbind(df, cbind(Zone=z, inittable$nicetable))
+}
+
+```
+
+
+```{r defaultBnd_allgen_13to18_byZone_plotMap, fig.height=6, fig.width=9, fig.align='center'}
+require(rasterVis)
+levelplot(ancils$mycl.f, maxpixels=600000, par.settings=rasterTheme(region=myLUT$Colours), xlab=NULL, ylab=NULL, xlim=c(-12,10), ylim=c(4,18), main="Vegetation classes and zones") + # , scales=list(draw=FALSE),  xlim=c(-24,15), ylim=c(-1,26), 
+    latticeExtra::layer(sp.polygons(land_simple, col="black", lty=2)) + 
+    latticeExtra::layer(sp.points(aftinit, pch="+", cex=2, col="black")) +
+    latticeExtra::layer(sp.polygons(spp)) 
+```
+
+```{r defaultBnd_allgen_13to18_byZone_printTable, results='asis', cache=FALSE}
+kable(df)
+```
+

@@ -1,0 +1,19 @@
+library(ggplot2)
+library(RColorBrewer)
+library(knitr)
+?kable
+pwd
+pwd()
+getwd()
+setwd('Work/Projects/InternalSabbatical/Scripts/allruns/')
+setwd('functions/')
+source('loadAllAncils.R')
+ancils <- loadAllAncils(myproj="ll", nBndClass=1, model="rb5216.4km.std", vegThreshold=0.2, bndDef=2, nBuf=3, overwrite=F)
+setwd('../')
+source('functions/loadAllAncils.R')
+ancils <- loadAllAncils(myproj="ll", nBndClass=1, model="rb5216.4km.std", vegThreshold=0.2, bndDef=2, nBuf=3, overwrite=F)
+indatadir <- "/Users/ajh235/Work/DataLocal/ModelData/WAFR/"
+ancils <- loadAllAncils(myproj="ll", nBndClass=1, model="rb5216.4km.std", vegThreshold=0.2, bndDef=2, nBuf=3, overwrite=F)
+ancils <- loadAllAncils(myproj="ll", nBndClass=1, model="rb5216.4km.std", vegThreshold=0.3, bndDef=1, nBuf=3, overwrite=F)
+ancils <- loadAllAncils(myproj="ll", nBndClass=1, model="rb5216.4km.std", vegThreshold=0.3, bndDef=2, nBuf=3, overwrite=F)
+ancils <- loadAllAncils(myproj="ll", nBndClass=1, model="rb5216.4km.std", vegThreshold=0.3, bndDef=2, nBuf=5, overwrite=F)

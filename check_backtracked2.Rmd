@@ -1,0 +1,197 @@
+---
+title: "Check Backtracked Results v2"
+author: "Andy Hartley"
+date: "28 August 2014"
+output:
+  html_document:
+    theme: journal
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+source("functions/saveSpatial.R")
+```
+
+This is an Rmarkdown document to check the results from the latest version of the backtracking results. 
+
+## Load Data
+
+First, let's load the data
+
+```{r}
+library(knitr)
+outresults_file <- "/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/backtracked_results_1000km_5min.Rdata"
+load(outresults_file)
+bt_results$Hour <- as.numeric(format(bt_results$timestep, "%H"))
+bt_results$Day <- as.numeric(format(bt_results$timestep, "%d"))
+```
+
+Get all the MCS that have IDs < 1502
+```{r}
+allmcs <- 1:1502
+```
+
+Which MCS *do* have a Generation point?
+```{r}
+genpt <- sort(allmcs[bt_results[bt_results$ID <= 1502 & bt_results$class == "Generation","ID"]])
+length(unique(genpt))
+```
+
+Which MCS *don't* have a Generation point?
+```{r}
+nogenpts <- allmcs[-bt_results[bt_results$ID <= 1502 & bt_results$class == "Generation","ID"]]
+length(unique(nogenpts))
+```
+
+## What happens to the MCS with no generation point?
+```{r}
+all_ngp_class <- vector("character")
+for (ngp in nogenpts){
+    # Get earliest record for this ID, and print class
+    first_time <- min(bt_results[bt_results$ID == ngp, "timestep"])
+    ft_class <- bt_results[bt_results$ID == ngp & bt_results$timestep == first_time, "class"]
+    ft_related <- bt_results[bt_results$ID == ngp & bt_results$timestep == first_time, "related"]
+    # print(paste("ID:",ngp, " Time:",first_time," Class:",ft_class," Related:",ft_related))
+    ft_class <- sub("minor parts from ID [0-9]{1,6}", "minor parts", ft_class)
+    all_ngp_class <- append(x = all_ngp_class, values = ft_class)
+}
+```
+
+```{r results='asis'}
+kable(as.data.frame(table(all_ngp_class)), format="markdown")
+```
+
+ * The majority (`r round(100*(412+38+33)/752)`%) are small parts of a split in the previous timestep - the largest overlap of the split takes the ID of the previous timestep, but the smaller parts need a new ID.
+ * Some (`r round(100*(100+38+1)/752)`%) also dissipate after this timestep
+
+## What is going on with the high ID numbers? 
+```{r}
+large_id <- sort(unique(bt_results[bt_results$ID > 1502,"ID"]))
+all_lid_class <- vector("character")
+end_lid_class <- vector("character")
+for (lid in large_id){
+    first_time <- min(bt_results[bt_results$ID == lid, "timestep"])
+    last_time <- max(bt_results[bt_results$ID == lid, "timestep"])
+    ft_class <- bt_results[bt_results$ID == lid & bt_results$timestep == first_time, "class"]
+    ft_class <- sub("minor parts from ID [0-9]{1,6}", "minor parts", ft_class)
+    lt_class <- bt_results[bt_results$ID == lid & bt_results$timestep == last_time, "class"]
+    lt_class <- sub("minor parts from ID [0-9]{1,6}", "minor parts", lt_class)
+    ft_related <- bt_results[bt_results$ID == lid & bt_results$timestep == first_time, "related"]
+    # print(paste("ID:",lid, " Time:",first_time," Class:",ft_class," Related:",ft_related))
+    all_lid_class <- append(x = all_lid_class, values = ft_class)
+    end_lid_class <- append(x = end_lid_class, values = lt_class)
+}
+```
+
+###For Large IDs (>1502) what classes are most common in the _first_ timestep?
+```{r results='asis'}
+kable(as.data.frame(100 * table(all_lid_class) / length(all_lid_class)), format="markdown")
+```
+
+ * 67% (2285) of the large numbers are POP generations
+ * 31% (1034) are minor parts of splits in the current timestep
+
+
+###For Large IDs (>1502) what classes are most common in the _last_ timestep?
+```{r results='asis'}
+kable(as.data.frame(100 * table(end_lid_class) / length(end_lid_class)), format="markdown")
+```
+
+ * 55% are merges in the next timestep, meaning that they merge into other 
+ * 26% are generations, meaning that the last time step is also the first
+ * 16% are minor parts of splits
+
+###How many large IDs turn directly into MCS?
+```{r}
+table(bt_results[bt_results$ID %in% large_id,"type"])
+```
+ 
+ * Answer: 0
+ * All results with a large ID (>1502) do not progress into MCS, although they may merge with other convective cells to form MCS. They either:
+    + Die out straight after generation (26%). Or maybe they do not overlap in the second timestep - see above
+    + or, they merge with larger cells (55%)
+
+###How many large IDs can we remove because they generate and then dissipate before reaching the MCS threshold?
+```{r}
+# All large_id that have "Generation" at their last and first timestep
+lid_gen_lt <- large_id[which(end_lid_class == "Generation")]
+sp_data <- saveSpatial(bt_results[bt_results$ID %in% lid_gen_lt,],"largeIDs_gen_in_last_timestep")
+```
+
+So, there are `r length(lid_gen_lt)` large IDs that dissipate the timestep after they generate
+
+###How many of each class once all of the '1 timestep' generations are removed?
+
+```{r}
+#knitr::opts_chunk$set(cache=FALSE) # Forces recalculation
+lid_keep <- large_id[which(end_lid_class != "Generation")]
+all_lid_class2 <- vector("character")
+end_lid_class2 <- vector("character")
+for (lid in lid_keep){
+    first_time <- min(bt_results[bt_results$ID == lid, "timestep"])
+    last_time <- max(bt_results[bt_results$ID == lid, "timestep"])
+    ft_class <- bt_results[bt_results$ID == lid & bt_results$timestep == first_time, "class"]
+    ft_class <- sub("minor parts from ID [0-9]{1,6}", "minor parts", ft_class)
+    lt_class <- bt_results[bt_results$ID == lid & bt_results$timestep == last_time, "class"]
+    lt_class <- sub("minor parts from ID [0-9]{1,6}", "minor parts", lt_class)
+    all_lid_class2 <- append(x = all_lid_class2, values = ft_class)
+    end_lid_class2 <- append(x = end_lid_class2, values = lt_class)
+}
+lid_ones <- as.numeric(attributes(which(table(bt_results[bt_results$ID %in% lid_keep,"ID"])==1))$names)
+lid_ones_class <- bt_results[bt_results$ID %in% lid_ones,c("class")]
+lid_ones_class <- sub("minor parts from ID [0-9]{1,6}", "minor parts", lid_ones_class)
+```
+
+```{r}
+# Remove all POP (large IDs) that exist at only 1 timestep, and save the spatial data
+lid_gen_lt <- large_id[which(end_lid_class == "Generation")]
+bt_results_new <- bt_results[!(bt_results$ID %in% lid_gen_lt),]
+bt_results_new$class <- sub("minor parts from ID [0-9]{1,6}", "minor parts", bt_results_new$class)
+sp_data <- saveSpatial(bt_results_new,"bt_results_POP1t_removed")
+save(bt_results_new, file="/Users/ajh235/Work/DataLocal/Projects/InternalSabbatical/Results/backtracked_results_1000km_5min_POP1t_removed.Rdata")
+```
+
+
+This is how they start ...
+
+```{r results='asis'}
+mydf_lid_start <- as.data.frame(round(100 * table(all_lid_class2) / length(all_lid_class2)))
+colnames(mydf_lid_start) <- c("Class","%")
+mydf_lid_start <- cbind(mydf_lid_start, Count=as.data.frame(table(all_lid_class2))$Freq)
+kable(mydf_lid_start, format="markdown")
+```
+
+... and this is how they end ...
+```{r results='asis'}
+mydf_lid_end <- as.data.frame(round(100 * table(end_lid_class2) / length(end_lid_class2)))
+colnames(mydf_lid_end) <- c("Class","%")
+mydf_lid_end <- cbind(mydf_lid_end, Count=as.data.frame(table(end_lid_class2))$Freq)
+kable(mydf_lid_end, format="markdown")
+```
+
+
+
+###What are the classes of the remainder that have 1 timestep only?
+
+```{r results='asis'}
+kable(as.data.frame(table(lid_ones_class)), format="markdown")
+```
+
+
+## Conclusions
+
+1. We have `r length(unique(genpt))` MCS with generation points, and `r length(unique(nogenpts))` MCS without generation points. 
+
+2. Where an MCS doesn't have a generation point, it has generally been created because a larger MCS split up, and the new ID is created from the smaller parts of the split.
+
+3. Before convective cells reach the size threshold of an MCS, they can also split and merge. This creates new IDs (see IDs >1502), all of which are classified as POP. There are `r length(large_id)` unique IDs in this category, which contains a further `r length(bt_results[bt_results$ID %in% large_id & bt_results$class == "Generation","ID"])` initiations.
+
+    + However, some of these initiations die out straight away (ie. the ID only exists for one timestep). There are `r length(lid_gen_lt)` points when this occurs.
+    
+    + Once these initiations are removed, there are `r length(all_lid_class2)` separate small scale convective cells (POP). 
+    
+    + Of these, `r mydf_lid_start[mydf_lid_start$Class == "Generation","%"]`% have generation points, the remainder are created when an existing POP splits, and the smaller part of the split receives a new ID.
+
+
+
